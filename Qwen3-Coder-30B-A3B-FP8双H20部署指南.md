@@ -1,153 +1,257 @@
 # Qwen3-Coder-30B-A3B-Instruct-FP8 双 H20 部署指南
 
-## 部署规划
+## 方案说明
 
-建议按以下目录规划：**模型放在 2TB 盘，运行环境和日志放在 700GB 盘**。
+现有 `MODEL_DIR` 已供 **DeepSeek V4 Flash** 使用，本方案保持该变量不变。Qwen 全部使用独立变量：
+
+```bash
+QWEN_MODEL_DIR
+QWEN_WORKDIR
+QWEN_PORT
+```
+
+这样以后 DeepSeek 和 Qwen 可以并存，路径、脚本、端口都不会冲突。
+
+鉴于此前出现 **PyTorch cu132 / torchaudio cu130 冲突**，建议重新创建干净的 Qwen Python 环境，并明确锁定到 **CUDA 13.0**。vLLM 官方当前支持 `--torch-backend=cu130`。([vLLM][1])
+
+---
+
+## 一、最终目录规划
+
+你的磁盘：
+
+```text
+/mnt/data/txhan          700 GB
+/mnt/tydrive/txhan       2 TB
+```
+
+建议：
 
 ```text
 /mnt/tydrive/txhan/
+├── DeepSeek/
+│   └── ...                        # 你现有 DeepSeek，不动
+│
 ├── models/
-│   └── Qwen3-Coder-30B-A3B-Instruct-FP8/   # 模型，约31.2GB
-└── .cache/huggingface/                      # HF缓存
+│   └── Qwen3-Coder-30B-A3B-Instruct-FP8/
+│
+└── .cache/
+    └── huggingface/
 
 /mnt/data/txhan/
 └── qwen3-coder/
-    ├── .venv/                                # Python/vLLM环境
+    ├── .venv/
     ├── logs/
     ├── tmp/
     └── start_qwen.sh
 ```
 
-这次我建议你先用 **Qwen3-Coder-30B-A3B-Instruct-FP8**，而不是 BF16。它是 Qwen 官方 FP8 checkpoint，完整仓库约 **31.2GB**，官方明确支持直接用 vLLM；你的 H20 96GB 属于 Hopper，FP8 很合适。([Hugging Face][1])
+原则：
 
-另外，这个 Coder 版本是 **non-thinking 模型**，所以启动时**不要加 reasoning parser**；它有 30.5B 总参数、3.3B 激活参数、原生 262K context。([Hugging Face][2])
+```text
+2TB盘 → 模型、HF缓存
+700GB盘 → Python环境、日志、启动脚本
+```
 
 ---
 
-## 1. 检查磁盘与 GPU
+## 二、保留现有 MODEL_DIR
 
-先执行：
+你现在可能已经有：
 
 ```bash
-df -h /mnt/data/txhan /mnt/tydrive/txhan
+echo $MODEL_DIR
 ```
 
-然后：
+输出类似：
+
+```text
+/mnt/tydrive/txhan/DeepSeek/...
+```
+
+**不要改。**
+
+以后 Qwen 单独定义：
+
+```bash
+export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+export QWEN_WORKDIR=/mnt/data/txhan/qwen3-coder
+export QWEN_PORT=8000
+```
+
+检查：
+
+```bash
+echo $MODEL_DIR
+echo $QWEN_MODEL_DIR
+```
+
+应该是两个不同路径，例如：
+
+```text
+/mnt/tydrive/txhan/DeepSeek/DeepSeek-V4-Flash
+/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+```
+
+这两个变量完全可以同时存在。
+
+---
+
+## 三、检查 GPU
 
 ```bash
 nvidia-smi
 ```
 
-建议再看一下 8 卡拓扑：
+看 8 张 H20。
+
+再执行：
 
 ```bash
 nvidia-smi topo -m
 ```
 
-你主要观察 GPU 0 和 GPU 1 之间是什么连接。
-
-如果是类似：
-
-```text
-NV1
-NV2
-NV4
-NV8
-```
-
-说明有 NVLink/NVSwitch，适合 TP=2。
-
-如果 GPU 0/1 正在被别人用，先看：
-
-```bash
-nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu \
-  --format=csv
-```
-
-然后选择两个空闲 GPU。
-
-下面我先假设使用：
+我们暂时假设使用：
 
 ```text
 GPU 0
 GPU 1
 ```
 
+如果 0、1 被占用了，就换成其他两张，例如：
+
+```text
+GPU 6
+GPU 7
+```
+
+下面统一先按 `0,1` 写。
+
 ---
 
-## 2. 建目录
-
-执行：
+## 四、建立 Qwen 专属目录
 
 ```bash
-mkdir -p /mnt/tydrive/txhan/models
-mkdir -p /mnt/tydrive/txhan/.cache/huggingface
-
 mkdir -p /mnt/data/txhan/qwen3-coder
 mkdir -p /mnt/data/txhan/qwen3-coder/logs
 mkdir -p /mnt/data/txhan/qwen3-coder/tmp
+
+mkdir -p /mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+mkdir -p /mnt/tydrive/txhan/.cache/huggingface
 ```
 
-进入工作目录：
+然后：
 
 ```bash
 cd /mnt/data/txhan/qwen3-coder
 ```
 
-建议以后统一：
+定义变量：
 
 ```bash
+export QWEN_WORKDIR=/mnt/data/txhan/qwen3-coder
+export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
 export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
 export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
+export QWEN_PORT=8000
 ```
 
 检查：
 
 ```bash
+echo $QWEN_WORKDIR
+echo $QWEN_MODEL_DIR
 echo $HF_HOME
 echo $TMPDIR
 ```
 
-应该分别显示：
+---
+
+## 五、重建 Qwen 专属虚拟环境
+
+因为你已经碰到：
 
 ```text
-/mnt/tydrive/txhan/.cache/huggingface
-/mnt/data/txhan/qwen3-coder/tmp
+PyTorch CUDA 13.2
+torchaudio CUDA 13.0
 ```
+
+我建议不要修补这个旧环境，直接删掉。
+
+如果当前环境已经激活：
+
+```bash
+deactivate 2>/dev/null || true
+```
+
+进入目录：
+
+```bash
+cd /mnt/data/txhan/qwen3-coder
+```
+
+删除**仅 Qwen 的虚拟环境**：
+
+> [!CAUTION]
+> 执行前确认当前目录为 `/mnt/data/txhan/qwen3-coder`。以下命令只应删除该目录下的 `.venv`。
+
+```bash
+rm -rf .venv
+```
+
+这不会碰：
+
+```text
+DeepSeek
+Qwen模型
+HF缓存
+```
+
+只删 Python 环境。
 
 ---
 
-## 3. 创建独立 vLLM 环境
-
-你之前这台机器已经在用 `uv`，这里继续用它最省事。vLLM 当前官方也推荐：
-
-```bash
-uv pip install vllm --torch-backend=auto
-```
-
-让 `uv` 根据 NVIDIA 驱动自动选择 PyTorch/CUDA wheel。([vLLM][3])
-
-先：
+## 六、确认 uv
 
 ```bash
 uv --version
 ```
 
-然后创建环境：
+如果正常，例如：
+
+```text
+uv 0.12.x
+```
+
+就继续。
+
+建议更新一次：
+
+```bash
+uv self update
+```
+
+---
+
+## 七、建立 Python 3.10 环境
 
 ```bash
 cd /mnt/data/txhan/qwen3-coder
+```
 
+执行：
+
+```bash
 uv venv .venv --python 3.10
 ```
 
-激活：
+然后：
 
 ```bash
 source .venv/bin/activate
 ```
 
-确认：
+检查：
 
 ```bash
 which python
@@ -161,166 +265,295 @@ python --version
 Python 3.10.x
 ```
 
----
-
-## 4. 安装 vLLM 和 Hugging Face 工具
-
-执行：
+如果系统没有 Python 3.10：
 
 ```bash
-uv pip install -U vllm --torch-backend=auto
+uv python install 3.10
 ```
+
+然后重新：
+
+```bash
+uv venv .venv --python 3.10
+source .venv/bin/activate
+```
+
+---
+
+## 八、安装 vLLM：明确指定 CUDA 13.0
+
+这次**不要再用**：
+
+```bash
+--torch-backend=auto
+```
+
+因为刚才它把你的环境带到了 CUDA 13.2 组合。
+
+改成：
+
+```bash
+uv pip install -U vllm --torch-backend=cu130
+```
+
+vLLM 官方当前明确支持这种方式指定 CUDA 13.0 backend。([vLLM][1])
 
 然后：
 
 ```bash
-uv pip install -U huggingface_hub hf_xet
+uv pip install -U huggingface_hub
 ```
 
-检查：
+目前不需要主动装：
 
-```bash
-vllm --version
-hf --help
+```text
+torchaudio
+torchvision
 ```
 
-再检查 PyTorch 是否正常看到 8 张 H20：
+Qwen3-Coder 是纯文本模型。
+
+---
+
+## 九、检查 PyTorch / CUDA
+
+执行：
 
 ```bash
 python - <<'PY'
 import torch
 
-print("PyTorch:", torch.__version__)
-print("CUDA:", torch.version.cuda)
-print("CUDA available:", torch.cuda.is_available())
-print("GPU count:", torch.cuda.device_count())
+print("PyTorch version :", torch.__version__)
+print("PyTorch CUDA    :", torch.version.cuda)
+print("CUDA available  :", torch.cuda.is_available())
+print("GPU count       :", torch.cuda.device_count())
 
 for i in range(torch.cuda.device_count()):
     print(i, torch.cuda.get_device_name(i))
 PY
 ```
 
-你希望看到：
+重点应该看到：
 
 ```text
-CUDA available: True
-GPU count: 8
-0 NVIDIA H20
-1 NVIDIA H20
-...
-```
-
-如果这里不正常，**先不要下载模型**，先解决 CUDA/PyTorch。
-
----
-
-## 5. 下载 Qwen
-
-模型：
-
-```text
-Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
-```
-
-官方 FP8 仓库只有约 **31.2GB**，其中三个约 10GB shard 加最后一个约 1.17GB。([Hugging Face][1])
-
-定义路径：
-
-```bash
-export MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
-```
-
-执行：
-
-```bash
-hf download \
-  Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
-  --local-dir "$MODEL_DIR"
-```
-
-`hf download --local-dir` 是 Hugging Face 当前官方支持的下载方式，而且会保存下载元数据，所以掉线后重新执行同一命令可以避免从零重下。([Hugging Face][4])
-
-### 如果中途网络断掉
-
-直接：
-
-```bash
-hf download \
-  Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
-  --local-dir "$MODEL_DIR"
-```
-
-重新执行即可。
-
-不要删目录。
-
----
-
-## 6. 下载完成后检查
-
-执行：
-
-```bash
-du -sh "$MODEL_DIR"
-```
-
-大概应该：
-
-```text
-32G
-```
-
-查看模型 shard：
-
-```bash
-ls -lh "$MODEL_DIR"/model-*.safetensors
-```
-
-应该看到四个：
-
-```text
-model-00001-of-00004.safetensors   ~10G
-model-00002-of-00004.safetensors   ~10G
-model-00003-of-00004.safetensors   ~10G
-model-00004-of-00004.safetensors   ~1.2G
+PyTorch CUDA : 13.0
+CUDA available : True
+GPU count : 8
 ```
 
 然后：
 
 ```bash
-ls "$MODEL_DIR"
+nvidia-smi
 ```
 
-至少应该存在：
+这里顶部哪怕显示：
+
+```text
+CUDA Version: 13.2
+```
+
+也**没问题**。
+
+这是：
+
+```text
+NVIDIA Driver
+  └─ 最高支持 CUDA 13.2
+
+PyTorch
+  └─ 使用 CUDA 13.0 runtime
+```
+
+两者并不冲突。
+
+---
+
+## 十、确认无残留 torchaudio 冲突
+
+执行：
+
+```bash
+uv pip list | grep -E 'torch|vllm'
+```
+
+如果出现：
+
+```text
+torchaudio
+```
+
+再检查：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+对于这个 Qwen 环境，实际上不需要 torchaudio。
+
+如果它又引发版本冲突，直接：
+
+```bash
+uv pip uninstall torchaudio
+```
+
+然后：
+
+```bash
+python -c "import vllm; print(vllm.__version__)"
+```
+
+只要这里正常：
+
+```text
+vLLM ...
+```
+
+就可以继续。
+
+---
+
+## 十一、检查 Hugging Face 配置
+
+你之前可能已经在 `.bashrc` 写了：
+
+```bash
+HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
+HF_HUB_DISABLE_XET=1
+```
+
+确认：
+
+```bash
+echo $HF_HOME
+echo $HF_HUB_DISABLE_XET
+```
+
+我们不需要为了 Qwen 改 DeepSeek 正在使用的配置。
+
+尤其是：
+
+```text
+MODEL_DIR
+```
+
+完全不碰。
+
+---
+
+## 十二、下载 Qwen FP8
+
+我们下载：
+
+```text
+Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+```
+
+这是 Qwen 官方 FP8 checkpoint，也明确提供 vLLM 使用入口。([Hugging Face][2])
+
+先定义：
+
+```bash
+export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+```
+
+下载：
+
+```bash
+hf download \
+  Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --local-dir "$QWEN_MODEL_DIR"
+```
+
+注意这里已经完全没有：
+
+```bash
+$MODEL_DIR
+```
+
+所以不会碰 DeepSeek。
+
+---
+
+## 十三、如果下载中断
+
+直接重新执行同一条：
+
+```bash
+hf download \
+  Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+  --local-dir "$QWEN_MODEL_DIR"
+```
+
+不要：
+
+```bash
+rm -rf "$QWEN_MODEL_DIR"
+```
+
+Hugging Face 会利用已有下载内容。
+
+---
+
+## 十四、检查模型
+
+下载完成：
+
+```bash
+du -sh "$QWEN_MODEL_DIR"
+```
+
+然后：
+
+```bash
+ls -lh "$QWEN_MODEL_DIR"
+```
+
+重点确认存在：
 
 ```text
 config.json
-generation_config.json
 tokenizer.json
 tokenizer_config.json
-chat_template.jinja
 model.safetensors.index.json
 model-00001-of-00004.safetensors
 ...
 ```
 
+官方仓库确实就是这个 Qwen3-Coder FP8 模型。([Hugging Face][2])
+
 ---
 
-## 7. 首次双卡启动（最小配置）
+## 十五、首次启动：暂不启用 Agent 工具调用
 
-先不要急着加一大堆优化参数。
+这是非常重要的一步。
+
+第一次只验证：
+
+```text
+CUDA
+↓
+FP8
+↓
+TP=2
+↓
+vLLM
+↓
+Qwen
+```
 
 执行：
 
 ```bash
-source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
+cd /mnt/data/txhan/qwen3-coder
+source .venv/bin/activate
 
+export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
 export CUDA_VISIBLE_DEVICES=0,1
 export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
 export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
 
-vllm serve \
-  /mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name qwen3-coder \
   --tensor-parallel-size 2 \
   --max-model-len 65536 \
@@ -329,68 +562,51 @@ vllm serve \
   --port 8000
 ```
 
-这里几个参数的意义：
-
-```text
-CUDA_VISIBLE_DEVICES=0,1
-            ↓
-只允许使用物理 GPU 0、1
-
---tensor-parallel-size 2
-            ↓
-一个模型横跨两张 H20
-
---max-model-len 65536
-            ↓
-先开 64K
-不要第一天就开 262K
-
---gpu-memory-utilization 0.85
-            ↓
-最多使用约85%显存
-留安全余量
-```
+Qwen 官方 checkpoint 支持直接用 vLLM 启动。([Hugging Face][2])
 
 ---
 
-## 8. 观察 GPU 状态
-
-另开一个终端：
+## 十六、在另一终端观察 GPU
 
 ```bash
 watch -n 1 nvidia-smi
 ```
 
-加载期间应该看到 GPU 0/1 显存上涨。
-
-GPU 2～7 基本保持不动：
+应该主要看到：
 
 ```text
-GPU0   Qwen
-GPU1   Qwen
-
-GPU2   free
-GPU3   free
-GPU4   free
-GPU5   free
-GPU6   free
-GPU7   free
+GPU0    vLLM
+GPU1    vLLM
 ```
 
-如果看到模型占用了 8 卡，说明 `CUDA_VISIBLE_DEVICES` 没生效。
+GPU2～7 不应被这个实例占用。
+
+注意：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1
+```
+
+之后 vLLM 内部看到的是逻辑：
+
+```text
+cuda:0
+cuda:1
+```
+
+这是正常的。
 
 ---
 
-## 9. 确认服务启动成功
+## 十七、确认 API 启动
 
-vLLM 日志最后应该出现类似：
+看到类似：
 
 ```text
 Application startup complete
-Uvicorn running on http://0.0.0.0:8000
 ```
 
-先测试：
+另开终端：
 
 ```bash
 curl http://127.0.0.1:8000/v1/models
@@ -398,21 +614,13 @@ curl http://127.0.0.1:8000/v1/models
 
 应该看到：
 
-```json
-{
-  "data": [
-    {
-      "id": "qwen3-coder"
-    }
-  ]
-}
+```text
+qwen3-coder
 ```
 
 ---
 
-## 10. 首次生成测试
-
-执行：
+## 十八、测试生成
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -422,7 +630,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "messages": [
       {
         "role": "user",
-        "content": "Write a Python program that prints all NVIDIA GPUs and their memory usage by calling nvidia-smi."
+        "content": "Write a Python script that prints all NVIDIA GPUs and their memory usage using nvidia-smi."
       }
     ],
     "temperature": 0.2,
@@ -430,50 +638,34 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-如果正常返回 Python 代码：
+如果返回代码：
 
-> **模型本体 + 双 H20 TP + vLLM API 已经完全跑通。**
+```text
+H20
+↓
+vLLM
+↓
+Qwen
+↓
+OpenAI API
+```
+
+已经通了。
 
 ---
 
-## 11. 启用 Agent 工具调用
+## 十九、启用 Agent 工具调用
 
-你的最终目标不是聊天，而是：
-
-```text
-Pi
- ↓
-Qwen
- ↓
-决定调用工具
- ↓
-bash
-file edit
-git
-pytest
- ↓
-把结果返回给 Qwen
- ↓
-继续下一步
-```
-
-所以在普通生成确认正常以后，停掉 vLLM：
+普通生成确认无误以后：
 
 ```text
 Ctrl+C
 ```
 
-然后改成 Agent 版本启动：
+重新启动：
 
 ```bash
-source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
-
-export CUDA_VISIBLE_DEVICES=0,1
-export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
-export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
-
-vllm serve \
-  /mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8 \
+vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name qwen3-coder \
   --tensor-parallel-size 2 \
   --max-model-len 65536 \
@@ -485,39 +677,32 @@ vllm serve \
   --port 8000
 ```
 
-这里：
-
-```text
---enable-auto-tool-choice
-```
-
-允许模型自己决定是否调用工具。
-
-而：
-
-```text
---tool-call-parser qwen3_xml
-```
-
-是当前 vLLM 官方对：
+当前 vLLM 官方文档明确列出：
 
 ```text
 Qwen3-Coder-30B-A3B-Instruct
+→ qwen3_xml
 ```
 
-指定的 parser。([vLLM][5])
+作为 tool-call parser。([vLLM][3])
 
-这里**不要**加：
+所以这里不要写旧的：
 
-```bash
---reasoning-parser qwen3
+```text
+qwen3_coder
 ```
 
-因为 Qwen3-Coder-30B-A3B-Instruct 官方明确是 non-thinking model。([Hugging Face][2])
+而是：
+
+```text
+qwen3_xml
+```
 
 ---
 
-## 12. 创建启动脚本
+## 二十、建立最终启动脚本
+
+这样以后根本不用记变量。
 
 创建：
 
@@ -531,15 +716,17 @@ nano /mnt/data/txhan/qwen3-coder/start_qwen.sh
 #!/usr/bin/env bash
 set -e
 
-source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
+QWEN_WORKDIR=/mnt/data/txhan/qwen3-coder
+QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+QWEN_PORT=8000
+
+source "$QWEN_WORKDIR/.venv/bin/activate"
 
 export CUDA_VISIBLE_DEVICES=0,1
 export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
-export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
+export TMPDIR="$QWEN_WORKDIR/tmp"
 
-MODEL=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
-
-exec vllm serve "$MODEL" \
+exec vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name qwen3-coder \
   --tensor-parallel-size 2 \
   --max-model-len 65536 \
@@ -548,26 +735,42 @@ exec vllm serve "$MODEL" \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_xml \
   --host 0.0.0.0 \
-  --port 8000
+  --port "$QWEN_PORT"
 ```
 
-保存，然后：
+注意这里甚至没有：
+
+```text
+MODEL_DIR
+```
+
+所以 DeepSeek 的变量完全不会污染 Qwen。
+
+保存：
+
+```text
+Ctrl+O
+Enter
+Ctrl+X
+```
+
+加权限：
 
 ```bash
 chmod +x /mnt/data/txhan/qwen3-coder/start_qwen.sh
 ```
 
-以后启动只需要：
+以后：
 
 ```bash
 /mnt/data/txhan/qwen3-coder/start_qwen.sh
 ```
 
+即可。
+
 ---
 
-## 13. 使用 tmux 常驻运行
-
-创建：
+## 二十一、使用 tmux 常驻运行
 
 ```bash
 tmux new -s qwen
@@ -579,38 +782,73 @@ tmux new -s qwen
 /mnt/data/txhan/qwen3-coder/start_qwen.sh
 ```
 
-退出但不关闭模型：
+退出但不停止：
 
 ```text
 Ctrl+B
-然后 D
+D
 ```
 
-重新进入：
+回来：
 
 ```bash
 tmux attach -t qwen
 ```
 
-查看：
-
-```bash
-tmux ls
-```
-
-这样 SSH 断了，Qwen 也不会跟着停。
+这样 SSH 断线，Qwen 不会停。
 
 ---
 
-## 14. 从 Windows 测试服务器
+## 二十二、为 DeepSeek 和 Qwen 分配独立端口
 
-因为你现在的 Pi 是在 Windows 上用，所以需要让 Windows 能访问 Ubuntu 上的：
+以后你的 DeepSeek 也启动以后，不建议都抢：
 
 ```text
 8000
 ```
 
-我更建议使用 **SSH tunnel**，而不是直接把 8000 暴露出去。
+建议固定：
+
+```text
+Qwen       → 8000
+DeepSeek   → 8001
+```
+
+或者：
+
+```text
+Qwen       → 8001
+DeepSeek   → 8000
+```
+
+比如我建议：
+
+```bash
+QWEN_PORT=8001
+```
+
+那么 Qwen 脚本最后改：
+
+```bash
+--port 8001
+```
+
+这样以后：
+
+```text
+http://server:8000/v1 → DeepSeek
+http://server:8001/v1 → Qwen
+```
+
+管理起来最清晰。
+
+**如果 DeepSeek 现在还只是在下载，没有启动服务，那么 Qwen 暂时用 8000 完全没问题。**
+
+---
+
+## 二十三、Windows 访问服务器
+
+如果服务器 IP 不直接开放 8000，建议走 SSH tunnel。
 
 Windows PowerShell：
 
@@ -618,59 +856,31 @@ Windows PowerShell：
 ssh -N -L 8000:127.0.0.1:8000 用户名@服务器IP
 ```
 
-这个窗口保持开着。
+保持这个窗口开着。
 
-然后在另一个 PowerShell：
+再开 PowerShell：
 
 ```powershell
 curl.exe http://127.0.0.1:8000/v1/models
 ```
 
-如果返回：
+应该出现：
 
 ```text
 qwen3-coder
 ```
 
-就意味着：
-
-```text
-Windows
-   │
-   │ localhost:8000
-   ↓
-SSH tunnel
-   ↓
-Ubuntu Server
-   ↓
-vLLM
-   ↓
-2 × H20
-```
-
-已经通了。
-
 ---
 
-## 15. 接入 Pi
+## 二十四、接入 Pi
 
-Pi 当前官方支持通过：
-
-```text
-~/.pi/agent/models.json
-```
-
-添加 vLLM / OpenAI-compatible 自定义模型。([GitHub][6])
-
-Windows 文件位置：
+你 Windows 上的 Pi 配置：
 
 ```text
 C:\Users\TxHan\.pi\agent\models.json
 ```
 
-如果没有就新建。
-
-可以先写：
+可以添加：
 
 ```json
 {
@@ -705,82 +915,77 @@ C:\Users\TxHan\.pi\agent\models.json
 }
 ```
 
-Pi 官方文档明确给出了这种 vLLM / OpenAI-compatible custom provider 配置方式。([GitHub][7])
-
-然后：
+启动：
 
 ```powershell
 pi
 ```
 
-进入 Pi 后：
+然后：
 
 ```text
 /model
 ```
 
-应该能看到：
+选择：
 
 ```text
 Qwen3-Coder 30B A3B FP8 - 2xH20
 ```
 
-选中它。
-
 ---
 
-## 16. 进行真实 Agent 测试
+## 二十五、进行真实 Coding Agent 测试
 
-进入你的代码项目，比如：
+不要只问：
+
+```text
+你好
+```
+
+进入一个 Git 项目：
 
 ```powershell
-cd D:\YourProject
+cd D:\你的项目
 pi
 ```
 
-给它：
+然后让它：
 
 ```text
-Inspect this repository, determine how the project is structured,
-run the existing tests, identify any failing tests, and explain what
-needs to be fixed. Do not modify anything yet.
+Inspect this repository first.
+Run the existing tests.
+Identify the current failures and explain the likely cause.
+Do not modify files yet.
 ```
 
-这时候你要观察它有没有：
+你要观察它是不是能：
 
 ```text
-读取文件
- ↓
-执行命令
- ↓
-检查 Git
- ↓
-跑测试
- ↓
+读取 repo
+   ↓
+调用 terminal
+   ↓
+运行 git / pytest / npm / python
+   ↓
 读取 stdout/stderr
+   ↓
+继续分析
 ```
 
-如果这套链路正常，才说明你真正完成了：
-
-> **Qwen → Pi → Terminal Agent**
-
-而不只是“模型能聊天”。
+如果可以，这才叫整个 Agent 链路跑通。
 
 ---
 
-## 17. 稳定后将上下文从 64K 提升到 128K
+## 二十六、稳定后将上下文提升至 128K
 
-不要一开始就 256K。
+先保持：
 
-先：
-
-```text
-65536
+```bash
+--max-model-len 65536
 ```
 
-确认稳定。
-
-然后修改启动脚本：
+跑稳定以后改：
 
 ```bash
 --max-model-len 131072
@@ -792,103 +997,71 @@ Pi 同时改：
 "contextWindow": 131072
 ```
 
-如果还是稳定，再考虑：
+Qwen3-Coder 这个模型本身支持更长上下文，但你现在的目标首先是**稳定把 Pi + Qwen + H20 跑通**，没有必要第一步就把 KV Cache 拉到最大。([Hugging Face][4])
+
+---
+
+## 当前建议的执行起点
+
+因为你已经：
+
+* 安装了 `uv`
+* 建过一次环境
+* 但碰到了 Torch/TorchAudio CUDA 版本冲突
+* `MODEL_DIR` 已经给 DeepSeek 用了
+
+所以**不用从第一步重新折腾系统**。你现在从这里开始执行即可：
 
 ```bash
---max-model-len 262144
+cd /mnt/data/txhan/qwen3-coder
+
+deactivate 2>/dev/null || true
+rm -rf .venv
+
+uv self update
+
+uv venv .venv --python 3.10
+source .venv/bin/activate
+
+uv pip install -U vllm --torch-backend=cu130
+uv pip install -U huggingface_hub
 ```
 
-这个模型原生就支持 262,144 tokens，所以不需要 YaRN 才达到这个长度。([Hugging Face][2])
+然后：
 
----
+```bash
+python - <<'PY'
+import torch
+print("torch:", torch.__version__)
+print("CUDA:", torch.version.cuda)
+print("available:", torch.cuda.is_available())
+print("GPU count:", torch.cuda.device_count())
+PY
+```
 
-## 18. TP=1 与 TP=2 的性能说明
+**先确认这里显示 `CUDA: 13.0`，再往后下载 Qwen。**
 
-**2×H20 一定能很好地跑，但“双卡一定比单卡更快”并不成立。**
-
-因为这个 FP8 checkpoint 只有约：
+而以后整个方案最关键的变量规范就是：
 
 ```text
-31.2 GB
+MODEL_DIR          → 留给你现有 DeepSeek，不碰
+
+QWEN_MODEL_DIR     → Qwen专用
+QWEN_WORKDIR       → Qwen专用
+QWEN_PORT          → Qwen专用
 ```
 
-而你的单张 H20：
+这样即使未来你再部署 Gemma，也建议继续采用：
 
 ```text
-96 GB
+GEMMA_MODEL_DIR
+GEMMA_WORKDIR
+GEMMA_PORT
 ```
 
-单卡已经能完整装下。
+不会再发生模型之间环境变量互相覆盖的问题。
 
-对于 Qwen3-Coder 这种 **3.3B active MoE**：
-
-```text
-TP=2
-```
-
-会减少每张卡计算量，但也会产生 NCCL/NVLink 通信。
-
-所以实际可能出现：
-
-```text
-单卡：
-token latency 更低
-
-双卡：
-prefill / 长上下文 / 并发更好
-KV cache空间极大
-```
-
-你既然现在明确想试 **2 卡方案**，我们先用 TP=2。
-
-等跑起来后，非常值得做一个：
-
-```text
-TP=1 vs TP=2
-```
-
-实测。
-
-不要凭理论猜。
-
----
-
-## 推荐执行顺序
-
-```text
-① nvidia-smi
-        ↓
-② nvidia-smi topo -m
-        ↓
-③ 建目录
-        ↓
-④ uv 创建 venv
-        ↓
-⑤ 安装 vLLM
-        ↓
-⑥ 下载官方 31.2GB FP8 Qwen
-        ↓
-⑦ TP=2、64K、不加 tool calling
-        ↓
-⑧ curl 普通对话测试
-        ↓
-⑨ 加 qwen3_xml tool calling
-        ↓
-⑩ Windows SSH tunnel
-        ↓
-⑪ Pi models.json
-        ↓
-⑫ /model 选择 qwen3-coder
-        ↓
-⑬ 真实 repo 测试
-```
-
-**最重要的是第 7 步先用最小参数启动。** 如果那里报错，把从执行 `vllm serve` 开始到最后报错的完整日志贴给我，我可以直接沿着你的实际 H20/CUDA/vLLM 环境往下排，不需要重新安装一遍。
-
-[1]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
-[2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/c0ca79e77eaff38abb4b0709051148f5280fb4aa/README.md?code=true "README.md · Qwen/Qwen3-Coder-30B-A3B-Instruct at c0ca79e77eaff38abb4b0709051148f5280fb4aa"
-[3]: https://docs.vllm.ai/en/latest/getting_started/installation/gpu/ "GPU - vLLM"
-[4]: https://huggingface.co/docs/huggingface_hub/main/package_reference/cli "hf · Hugging Face"
-[5]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
-[6]: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/providers.md "pi/packages/coding-agent/docs/providers.md at main · earendil-works/pi · GitHub"
-[7]: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md "pi/packages/coding-agent/docs/models.md at main · earendil-works/pi · GitHub"
+[1]: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/ "GPU - vLLM"
+[2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
+[3]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
+[4]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/blob/main/config.json "config.json · Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"

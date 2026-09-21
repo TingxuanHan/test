@@ -1,6 +1,6 @@
-# Qwen3-Coder-30B-A3B-Instruct-FP8双H20部署指南
+# Qwen3-Coder-30B-A3B-Instruct-FP8双H20部署与Pi Coding Agent集成指南
 
-本文给出一套从环境核验、安装、模型下载、双卡启动，到OpenAI兼容API与Coding Agent接入的完整流程。所有命令统一以CUDA 12.9为基准，不再混用其他CUDA变体。
+本文给出一套从环境核验、安装、模型下载、双卡启动，到Ubuntu非root安装Pi、注册本地模型和验证真实代码修改的完整流程。所有命令统一以CUDA 12.9为基准，不再混用其他CUDA变体。
 
 > 本文面向当前这台8×H20服务器，Qwen默认使用GPU 0、1。模型放在2TB盘，Python环境、wheel、临时文件和日志放在700GB盘。已有DeepSeek配置保持不变。
 
@@ -20,6 +20,9 @@
 | Qwen端口 | 8001 |
 | 初始生产上下文 | 65,536 tokens |
 | 工具调用解析器 | qwen3_xml |
+| Pi Coding Agent | 0.86.1 |
+| Node.js | ≥22.19.0 |
+| Pi模型配置 | ~/.pi/agent/models.json |
 
 最终必须同时满足：
 
@@ -30,6 +33,7 @@ torch.version.cuda 12.9
 vLLM 0.29.0+cu129
 vLLM动态库不依赖libcudart.so.13
 Qwen API监听127.0.0.1:8001
+Pi可通过qwen-local/qwen3-coder完成读取、运行、修改和复测
 ~~~
 
 Qwen3-Coder-30B-A3B-Instruct-FP8原生支持262,144 tokens，但首次稳定运行建议从8K开始，确认双卡、API和工具调用均正常后，再提升到64K。128K和262K放在最后做阶梯测试。
@@ -775,68 +779,127 @@ curl -fsS http://127.0.0.1:8001/v1/chat/completions \
 
 目标是响应中的<code>choices[0].message.tool_calls</code>包含<code>calculator</code>及参数37、19。vLLM只负责生成工具调用；真正执行函数、把结果追加为tool消息并再次请求模型，是调用端的职责。
 
-## 15. 使用tmux常驻运行
+## 15. 在Ubuntu中以非root用户安装Pi
 
-创建会话：
+Pi和Qwen应运行在同一台Ubuntu服务器上。Qwen占用GPU 0、1并监听本机8001端口；Pi使用当前普通用户的权限访问项目文件，不需要也不应以root身份启动。
+
+先确认当前身份：
+
+~~~bash
+whoami
+id -u
+echo "$HOME"
+~~~
+
+预期用户名类似<code>txhan</code>，UID不应为0，HOME应类似<code>/home/txhan</code>。如果当前就是root，请先切换回日常使用的普通用户。
+
+### 15.1 检查Node.js
+
+Pi 0.86.1要求Node.js 22.19.0或更高版本：
+
+~~~bash
+node -v
+npm -v
+~~~
+
+如果Node不存在或版本过低，推荐通过nvm安装。nvm安装在当前用户目录，不会把Node和npm包写入<code>/root</code>或系统目录：
+
+~~~bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.6/install.sh | bash
+source ~/.bashrc
+
+nvm install 22
+nvm use 22
+nvm alias default 22
+
+node -v
+npm -v
+command -v node
+command -v npm
+~~~
+
+确认Node版本不低于22.19.0，并且路径位于当前用户的<code>~/.nvm</code>目录。
+
+如果必须继续使用系统Node，可把npm全局目录改到当前用户HOME：
+
+~~~bash
+mkdir -p ~/.local/npm
+npm config set prefix ~/.local/npm
+grep -qxF 'export PATH="$HOME/.local/npm/bin:$PATH"' ~/.bashrc \
+  || echo 'export PATH="$HOME/.local/npm/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+npm config get prefix
+~~~
+
+使用nvm时通常不需要这组npm prefix命令。
+
+### 15.2 安装固定版本的Pi
+
+~~~bash
+npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.86.1
+
+pi --version
+command -v pi
+~~~
+
+先确认Pi本身能够进入交互界面：
+
+~~~bash
+pi
+~~~
+
+完成检查后按<code>Ctrl+C</code>退出。不要使用<code>sudo npm install -g</code>，也不要使用<code>sudo pi</code>。
+
+## 16. 启动Qwen并确认工具调用模式
+
+Pi接入前，先启动第13节生成的固定脚本。推荐在tmux中运行：
 
 ~~~bash
 tmux new -s qwen
-~~~
 
-在会话中启动并记录日志：
-
-~~~bash
 /mnt/data/txhan/qwen3-coder/start_qwen.sh \
   2>&1 | tee -a /mnt/data/txhan/qwen3-coder/logs/qwen.log
 ~~~
 
-按<code>Ctrl+B</code>，再按<code>D</code>退出tmux但保持服务运行。
+看到服务完成加载后，按<code>Ctrl+B</code>，再按<code>D</code>退出tmux但保持服务运行。
 
-查看会话：
-
-~~~bash
-tmux ls
-~~~
-
-重新进入：
+在另一个Ubuntu终端验证：
 
 ~~~bash
-tmux attach -t qwen
+curl -fsS http://127.0.0.1:8001/v1/models
+ss -ltnp | grep ':8001'
 ~~~
 
-查看日志：
-
-~~~bash
-tail -f /mnt/data/txhan/qwen3-coder/logs/qwen.log
-~~~
-
-停止服务时进入tmux会话并按<code>Ctrl+C</code>，让vLLM正常退出。
-
-## 16. Windows通过SSH隧道访问
-
-服务默认只监听服务器本机的127.0.0.1，更安全。Windows PowerShell执行：
-
-~~~powershell
-ssh -N -L 8001:127.0.0.1:8001 用户名@服务器IP
-~~~
-
-保持该窗口运行，然后在另一个PowerShell窗口测试：
-
-~~~powershell
-curl.exe http://127.0.0.1:8001/v1/models
-~~~
-
-如果改用<code>--host 0.0.0.0</code>直接开放端口，应同时配置服务器防火墙、访问控制和API鉴权；不要把无鉴权接口直接暴露到公网。
-
-## 17. 接入Pi
-
-Windows配置文件：
+返回模型列表中必须包含<code>qwen3-coder</code>。启动日志或进程参数中还必须同时包含：
 
 ~~~text
-C:\Users\TxHan\.pi\agent\models.json
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
 ~~~
 
-在现有<code>providers</code>中加入以下provider；如果文件里已有其他provider，不要整文件覆盖：
+如果第14.3节的原始API工具调用测试尚未通过，先修复vLLM侧问题，不要继续配置Pi。
+
+## 17. 备份并配置Pi的本地Qwen模型
+
+Pi在Ubuntu中的自定义模型配置文件是：
+
+~~~text
+~/.pi/agent/models.json
+~~~
+
+先创建目录，并对已有配置做时间戳备份：
+
+~~~bash
+mkdir -p ~/.pi/agent
+
+if [ -f ~/.pi/agent/models.json ]; then
+  cp -a ~/.pi/agent/models.json \
+    ~/.pi/agent/models.json.bak.$(date +%Y%m%d-%H%M%S)
+fi
+~~~
+
+如果文件不存在，新建<code>~/.pi/agent/models.json</code>并写入：
 
 ~~~json
 {
@@ -871,91 +934,296 @@ C:\Users\TxHan\.pi\agent\models.json
 }
 ~~~
 
+如果文件中已经有其他provider，只把<code>qwen-local</code>对象合并到现有<code>providers</code>中，不要整文件覆盖。<code>apiKey</code>使用<code>local</code>是有意设置的dummy key；本机vLLM虽然不校验密钥，但Pi需要该字段来正常启用模型。
+
+配置中的<code>contextWindow</code>必须与vLLM的<code>--max-model-len</code>一致。本文首个常驻配置统一为65,536。
+
+## 18. 验证JSON、模型列表和基础连通性
+
+先验证JSON语法。以下两种方法任选一种：
+
+~~~bash
+jq . ~/.pi/agent/models.json
+~~~
+
+或：
+
+~~~bash
+python3 -m json.tool ~/.pi/agent/models.json
+~~~
+
+然后确认API仍在线，并让Pi加载自定义模型：
+
+~~~bash
+curl -fsS http://127.0.0.1:8001/v1/models
+pi --list-models qwen
+~~~
+
+模型列表中应出现：
+
+~~~text
+qwen-local/qwen3-coder
+~~~
+
+第一次先用one-shot请求验证完整链路：
+
+~~~bash
+pi --model qwen-local/qwen3-coder \
+  -p "Reply with exactly LOCAL_QWEN_OK"
+~~~
+
+目标输出为：
+
+~~~text
+LOCAL_QWEN_OK
+~~~
+
+这一步只证明<code>Pi → models.json → vLLM → Qwen</code>的普通请求已连通，还不能替代后面的工具调用测试。
+
+## 19. 在安全目录中验证读取和工具调用
+
+先使用专门的测试目录，不要直接让模型操作重要仓库：
+
+~~~bash
+mkdir -p ~/pi-qwen-test
+cd ~/pi-qwen-test
+printf 'hello\n' > test.txt
+
+pi --model qwen-local/qwen3-coder
+~~~
+
+在Pi中输入：
+
+~~~text
+Use the bash tool to run pwd and ls -la. Then read test.txt and tell me its contents. Do not modify anything.
+~~~
+
+预期过程是Qwen生成结构化工具调用，Pi依次执行<code>bash</code>、<code>ls</code>或<code>read</code>，再把结果返回给Qwen。最终应正确报告<code>test.txt</code>内容为<code>hello</code>，并且文件没有变化。
+
+Pi内置的常用工具包括<code>read</code>、<code>bash</code>、<code>edit</code>、<code>write</code>、<code>grep</code>、<code>find</code>和<code>ls</code>。真正访问文件和执行命令的是Pi进程，不是vLLM服务本身。
+
+## 20. 验证文件修改
+
+仍在<code>~/pi-qwen-test</code>中，让Pi执行：
+
+~~~text
+Change test.txt from "hello" to "hello from local Qwen". Then read it back to verify the change.
+~~~
+
+退出Pi后验证：
+
+~~~bash
+cat ~/pi-qwen-test/test.txt
+~~~
+
+预期结果：
+
+~~~text
+hello from local Qwen
+~~~
+
+如果模型只输出建议而没有调用<code>edit</code>或<code>write</code>，先检查第16节的两个工具调用参数和第14.3节的原始API响应，不要通过提升Pi权限来规避。
+
+## 21. 验证真实代码定位、修复和复测
+
+创建一个可安全破坏的最小Python项目：
+
+~~~bash
+mkdir -p ~/pi-code-test
+cd ~/pi-code-test
+
+cat > calc.py <<'PY'
+def add(a, b):
+    return a - b
+
+print(add(2, 3))
+PY
+
+pi --model qwen-local/qwen3-coder
+~~~
+
+在Pi中输入：
+
+~~~text
+Inspect the current directory.
+Run calc.py.
+Find the bug.
+Fix it.
+Run it again and verify the output.
+~~~
+
+完整链路应类似：
+
+~~~text
+Qwen生成tool_calls
+  ↓
+Pi执行ls和read
+  ↓
+Pi执行python calc.py，首次得到-1
+  ↓
+Qwen请求edit，把减法改为加法
+  ↓
+Pi再次执行python calc.py
+  ↓
+输出5
+~~~
+
+退出Pi后再独立复核：
+
+~~~bash
+cd ~/pi-code-test
+python3 calc.py
+sed -n '1,20p' calc.py
+~~~
+
+只有读取、运行、修改和复测全部完成，才说明Pi与本地Qwen的Coding Agent链路真正跑通。
+
+## 22. 保存默认模型和可选快捷命令
+
+### 22.1 在Pi中保存默认模型
+
 启动Pi：
 
-~~~powershell
+~~~bash
 pi
 ~~~
 
-执行：
+输入：
 
 ~~~text
 /model
 ~~~
 
-选择：
+选择<code>qwen-local/qwen3-coder</code>后，按<code>Ctrl+S</code>保存为默认模型。只选中模型而不按<code>Ctrl+S</code>，不会持久化默认设置。
 
-~~~text
-Qwen3-Coder 30B A3B FP8 - 2xH20
+Pi保存的对应设置字段是<code>defaultProvider</code>、<code>defaultModel</code>和<code>defaultThinkingLevel</code>。保存后退出并重新执行<code>pi</code>，确认默认模型仍是本地Qwen。
+
+### 22.2 创建固定模型的包装脚本
+
+如果不想依赖默认设置，可创建一个显式指定模型的命令：
+
+~~~bash
+mkdir -p ~/.local/bin
+
+cat > ~/.local/bin/pi-qwen <<'SH'
+#!/usr/bin/env bash
+exec pi --model qwen-local/qwen3-coder "$@"
+SH
+
+chmod +x ~/.local/bin/pi-qwen
+
+grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' ~/.bashrc \
+  || echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
 ~~~
 
-## 18. 进行真实Coding Agent测试
+以后进入任意项目后执行：
 
-不要只测试简单问答。进入一个可安全测试的Git仓库：
+~~~bash
+cd /你的项目
+pi-qwen
+~~~
+
+## 23. tmux常驻与日常使用
+
+如果系统没有tmux，并且当前用户有管理员权限：
+
+~~~bash
+sudo apt update
+sudo apt install -y tmux
+~~~
+
+日常启动Qwen：
+
+~~~bash
+tmux new -s qwen
+
+/mnt/data/txhan/qwen3-coder/start_qwen.sh \
+  2>&1 | tee -a /mnt/data/txhan/qwen3-coder/logs/qwen.log
+~~~
+
+按<code>Ctrl+B</code>，再按<code>D</code>脱离会话。常用维护命令：
+
+~~~bash
+tmux ls
+tmux attach -t qwen
+tail -f /mnt/data/txhan/qwen3-coder/logs/qwen.log
+~~~
+
+停止服务时，重新进入tmux会话并按<code>Ctrl+C</code>，让vLLM正常退出。
+
+确认API在线后，进入实际代码仓库：
+
+~~~bash
+cd /你的代码项目
+pi --model qwen-local/qwen3-coder
+~~~
+
+第一次处理真实仓库时，建议先给只读指令：
+
+~~~text
+Inspect this repository and explain its architecture.
+Do not modify anything yet.
+~~~
+
+确认模型理解正确后，再让它运行测试和修改文件。
+
+## 24. 非root权限与安全习惯
+
+Pi通过当前Ubuntu用户实际执行<code>bash</code>、<code>read</code>、<code>edit</code>和<code>write</code>。因此：
+
+- 不要运行<code>sudo pi</code>；
+- 不要把当前用户无条件加入高权限组；
+- 首次测试只使用<code>~/pi-qwen-test</code>和<code>~/pi-code-test</code>；
+- 进入重要仓库前先提交或备份现有改动；
+- 先让Pi解释将要执行的高风险命令，再由人工决定是否执行；
+- 对<code>apt</code>、<code>systemctl</code>、<code>/etc</code>、驱动和CUDA系统目录的修改保留人工确认；
+- 不向公网直接开放无鉴权的8001端口。
+
+Qwen本身不直接获得Linux权限。它只生成结构化<code>tool_calls</code>；vLLM通过<code>qwen3_xml</code>转换这些调用，Pi再以当前用户身份执行工具。
+
+## 25. Windows通过SSH隧道访问（可选）
+
+Pi与Qwen都运行在Ubuntu服务器时不需要SSH隧道，直接使用<code>127.0.0.1:8001</code>即可。
+
+如果要从Windows访问服务器上的Qwen，在Windows PowerShell中执行：
 
 ~~~powershell
-cd D:\你的项目
-pi
+ssh -N -L 8001:127.0.0.1:8001 用户名@服务器IP
 ~~~
 
-先进行只读任务：
+保持该窗口运行，再在另一个PowerShell窗口验证：
 
-~~~text
-Inspect this repository first.
-Run the existing tests.
-Identify the current failures and explain the likely cause.
-Do not modify files yet.
+~~~powershell
+curl.exe http://127.0.0.1:8001/v1/models
 ~~~
 
-完整链路应表现为：
+如果还要在Windows上运行Pi，Windows侧也需要单独安装Pi，并在Windows用户目录的<code>.pi\agent\models.json</code>中配置同一个<code>qwen-local</code>provider。不要把Ubuntu的<code>~/.pi</code>路径照搬成Windows路径。
 
-~~~text
-读取仓库
-  ↓
-发起工具调用
-  ↓
-调用端执行terminal命令
-  ↓
-把stdout/stderr作为tool结果返回
-  ↓
-模型继续分析
-~~~
+不要为了省去隧道而把vLLM改成<code>--host 0.0.0.0</code>并直接暴露到公网。
 
-同时检查：
+## 26. 从64K逐步提升上下文
 
-- Qwen日志中请求正常完成，没有tool parser错误；
-- Pi能正确识别<code>tool_calls</code>；
-- 模型没有把工具调用XML当普通文本输出；
-- API响应模型名始终是<code>qwen3-coder</code>；
-- 长任务不会因SSH隧道、客户端超时或上下文上限中断。
+模型原生上下文长度为262,144，但模型支持不等于当前显存和并发配置一定稳定。每次只调整一档，并同步修改vLLM与Pi。
 
-## 19. 从64K逐步提升上下文
+### 26.1 128K
 
-模型原生上下文长度为262,144，但可支持不等于当前并发配置一定稳定。每次只改<code>max-model-len</code>和必要的并发参数，完成长提示测试后再进入下一档。
-
-### 19.1 128K
-
-将启动脚本改为：
+将<code>start_qwen.sh</code>改为：
 
 ~~~text
 --max-model-len 131072
 --max-num-seqs 2
 ~~~
 
-其余参数先保持不变。验证：
-
-- 两张GPU均无OOM；
-- 能接受接近目标长度的真实代码仓库上下文；
-- 首token延迟在可接受范围；
-- 连续请求不会出现NCCL或CUDA错误。
-
-Pi配置同步改为：
+同时把<code>models.json</code>改为：
 
 ~~~json
 "contextWindow": 131072
 ~~~
 
-### 19.2 原生262K
+验证两张GPU都没有OOM、连续工具调用不报错、首token延迟可接受后，再继续下一档。
+
+### 26.2 原生262K
 
 128K稳定后再测试：
 
@@ -970,15 +1238,57 @@ Pi配置同步改为：
 "contextWindow": 262144
 ~~~
 
-如果OOM或吞吐明显不可接受，退回上一档。不要通过写入大于262,144的值来冒充更长上下文；超过原生长度需要额外的长上下文扩展方案，不属于本文的稳定基线。
+如果OOM、吞吐明显下降或长工具链不稳定，退回上一档。不要把Pi的<code>contextWindow</code>写得高于vLLM的<code>--max-model-len</code>，也不要通过填写大于262,144的数值来冒充更长上下文。
 
-## 20. 常见问题
+## 27. Qwen与Pi联合故障排查
 
-### 20.1 再次出现libcudart.so.13
+### 27.1 找不到pi命令
 
-说明当前环境中的vLLM不是本文固定的cu129 wheel，或残留动态库被优先加载。
+~~~bash
+command -v node
+command -v npm
+command -v pi
+npm config get prefix
+~~~
 
-检查：
+如果使用nvm，重新执行<code>source ~/.bashrc</code>和<code>nvm use 22</code>。如果使用用户npm prefix，确认<code>~/.local/npm/bin</code>已加入PATH。不要改用sudo安装来掩盖PATH问题。
+
+### 27.2 Pi模型列表中没有qwen-local
+
+依次检查：
+
+~~~bash
+python3 -m json.tool ~/.pi/agent/models.json
+pi --list-models qwen
+~~~
+
+确认provider名称为<code>qwen-local</code>、模型ID为<code>qwen3-coder</code>、<code>apiKey</code>存在且值为<code>local</code>，并确认配置文件属于当前用户而不是root。
+
+### 27.3 Pi提示连接失败或Connection refused
+
+~~~bash
+curl -fsS http://127.0.0.1:8001/v1/models
+ss -ltnp | grep ':8001'
+tmux ls
+tail -n 100 /mnt/data/txhan/qwen3-coder/logs/qwen.log
+~~~
+
+如果curl失败，问题在Qwen服务或端口，不在Pi配置。确认Qwen使用8001，不要误连DeepSeek的8000端口。
+
+### 27.4 普通对话成功，但工具调用失败
+
+先重新执行第14.3节的原始API工具调用测试。检查Qwen启动命令是否同时包含：
+
+~~~text
+--enable-auto-tool-choice
+--tool-call-parser qwen3_xml
+~~~
+
+不要添加reasoning parser。若模型把工具XML当普通文本输出，重点检查vLLM版本、模型名、tool parser参数和启动日志。
+
+### 27.5 再次出现libcudart.so.13
+
+说明当前环境中的vLLM不是本文固定的cu129 wheel，或有错误动态库被优先加载：
 
 ~~~bash
 source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
@@ -1002,7 +1312,7 @@ uv pip install "$VLLM_WHEEL" \
 
 随后重新执行第7节全部验证。
 
-### 20.2 出现packaging版本冲突
+### 27.6 出现packaging版本冲突
 
 ~~~bash
 uv pip install \
@@ -1011,25 +1321,23 @@ uv pip install \
   'flashinfer-python==0.6.18'
 ~~~
 
-再安装本地wheel，并保留<code>--index-strategy unsafe-best-match</code>。
+再安装本地cu129 wheel，并保留<code>--index-strategy unsafe-best-match</code>。
 
-### 20.3 nvcc不是12.9
+### 27.7 nvcc不是12.9
 
 ~~~bash
 export CUDA_HOME=/usr/local/cuda-12.9
 export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 hash -r
 
 command -v nvcc
 nvcc --version
 ~~~
 
-不要为了Qwen修改DeepSeek正在使用的全局CUDA配置；优先把CUDA路径固定在<code>start_qwen.sh</code>内。
+不要为了Qwen修改DeepSeek正在使用的全局CUDA配置；CUDA路径应固定在Qwen的<code>start_qwen.sh</code>中。
 
-### 20.4 双卡启动失败或NCCL报错
-
-先检查拓扑和GPU占用：
+### 27.8 双卡启动失败、NCCL报错或OOM
 
 ~~~bash
 nvidia-smi
@@ -1043,31 +1351,38 @@ export NCCL_DEBUG=INFO
 /mnt/data/txhan/qwen3-coder/start_qwen.sh
 ~~~
 
-不要把<code>NCCL_P2P_DISABLE=1</code>之类的规避参数直接写入最终脚本。只有在日志证明P2P路径异常时，才做单项对照测试。
-
-### 20.5 OOM
-
-按以下顺序降低资源压力：
+OOM时按以下顺序降低压力：
 
 1. 将<code>max-model-len</code>从64K降到32K或8K；
 2. 将<code>max-num-seqs</code>降到2或1；
 3. 将<code>max-num-batched-tokens</code>降到4096；
-4. 确认GPU没有其他进程；
+4. 确认GPU 0、1没有其他进程；
 5. 最后再小幅降低<code>gpu-memory-utilization</code>。
 
-模型官方也建议OOM时先把上下文长度降到32,768。
+不要把<code>NCCL_P2P_DISABLE=1</code>之类的规避参数直接写入最终脚本。只有日志证明对应路径异常时，才做单项对照测试。
 
-### 20.6 端口8001已占用
+### 27.9 Pi读取或修改文件时Permission denied
+
+~~~bash
+whoami
+pwd
+ls -ld .
+ls -l
+~~~
+
+Pi只能使用当前用户已有的文件权限。不要通过<code>sudo pi</code>解决；应先确认项目所有者和目标路径，再对单个必要目录做最小权限修复。
+
+### 27.10 端口8001占用或模型下载不完整
+
+检查占用者：
 
 ~~~bash
 ss -ltnp | grep ':8001'
 ~~~
 
-先确认占用者，再决定停止旧Qwen进程或调整Qwen专属端口。不要误停DeepSeek进程。
+确认进程后再停止旧Qwen实例或调整Qwen专属端口，不要误停DeepSeek。
 
-### 20.7 模型下载不完整
-
-直接重复：
+模型不完整时可重复断点下载：
 
 ~~~bash
 hf download \
@@ -1077,9 +1392,9 @@ hf download \
 
 不要先删除整个模型目录。
 
-## 21. 明确禁止的操作
+## 28. 明确禁止的操作
 
-不要执行未指定CUDA变体的vLLM升级或重装命令，例如：
+不要执行未指定CUDA变体的vLLM升级或重装命令：
 
 ~~~text
 uv pip install -U vllm
@@ -1089,19 +1404,65 @@ pip install -U vllm
 
 也不要：
 
-- 使用自动脚本临时抓取“最新”wheel并覆盖固定版本；
+- 运行<code>sudo pi</code>或使用root的Pi配置；
+- 使用<code>sudo npm install -g</code>安装Pi；
+- 用自动脚本临时抓取“最新”vLLM wheel并覆盖固定版本；
 - 把Qwen目录写回DeepSeek的<code>MODEL_DIR</code>；
-- 将Qwen与DeepSeek放进同一个Python虚拟环境；
+- 把Qwen与DeepSeek放进同一个Python虚拟环境；
 - 因单个依赖冲突就删除整个<code>.venv</code>；
 - 未确认路径时递归删除模型、缓存或虚拟环境；
-- 只看<code>nvidia-smi</code>就判断Toolkit版本；
-- 在未完成8K和64K验证前直接上262K生产配置。
+- 只看<code>nvidia-smi</code>就判断CUDA Toolkit版本；
+- 在未完成8K、64K和Pi工具测试前直接上262K；
+- 把无鉴权的vLLM接口直接暴露到公网；
+- 在没有提交或备份的真实仓库中直接授权大范围修改。
 
-需要升级时，应重新确定一组完整兼容矩阵，并同时验证系统Toolkit、PyTorch、vLLM wheel、FlashInfer和动态库链接，不能只升级其中一个包。
+需要升级时，应重新确定一组完整兼容矩阵，同时验证CUDA Toolkit、PyTorch、vLLM wheel、FlashInfer、动态库链接、Pi版本和模型配置，不能只升级其中一个组件。
 
-## 22. 最终检查清单
+## 29. 最终架构与职责边界
 
-环境：
+~~~text
+Ubuntu Server
+│
+├── GPU 0 ─────┐
+│              ├── Qwen3-Coder-30B-A3B-Instruct-FP8
+├── GPU 1 ─────┘                  │
+│                                ▼
+│                         vLLM 0.29.0+cu129
+│                         qwen3_xml parser
+│                                │
+│                     127.0.0.1:8001/v1
+│                                │
+│                                ▼
+│                         Pi Coding Agent
+│                                │
+│              ┌─────────────────┼─────────────────┐
+│              ▼                 ▼                 ▼
+│            bash              read          edit / write
+│              └─────────────────┼─────────────────┘
+│                                ▼
+│                         当前用户的代码仓库
+│                         run / test / fix
+│
+└── GPU 2–7保留给DeepSeek或其他实验
+~~~
+
+职责边界是：
+
+~~~text
+Qwen只生成结构化tool_calls
+        ↓
+vLLM使用qwen3_xml完成协议转换
+        ↓
+Pi以当前Ubuntu用户身份调用本地工具
+        ↓
+工具结果返回Qwen，由模型决定下一步
+~~~
+
+因此，工具调用能否工作取决于Qwen、vLLM解析器、Pi配置和当前用户权限四层同时正确。
+
+## 30. 最终检查清单
+
+### 30.1 Qwen环境
 
 ~~~bash
 nvcc --version
@@ -1121,28 +1482,51 @@ PY
 uv pip check
 ~~~
 
-服务：
-
-~~~bash
-curl -fsS http://127.0.0.1:8001/v1/models
-ss -ltnp | grep ':8001'
-nvidia-smi
-~~~
-
-最终应确认：
+应确认：
 
 - <code>nvcc</code>是12.9；
 - <code>torch</code>是2.13.0+cu129；
 - <code>torch.version.cuda</code>是12.9；
 - <code>vLLM</code>是0.29.0+cu129；
+- vLLM动态库不依赖<code>libcudart.so.13</code>；
 - 两张H20都在工作；
 - Qwen只使用<code>QWEN_MODEL_DIR</code>、<code>QWEN_WORKDIR</code>和<code>QWEN_PORT</code>；
-- Qwen监听8001，DeepSeek配置未被修改；
+- DeepSeek的<code>MODEL_DIR</code>和8000端口未被修改。
+
+### 30.2 服务与Pi
+
+~~~bash
+curl -fsS http://127.0.0.1:8001/v1/models
+ss -ltnp | grep ':8001'
+nvidia-smi
+
+node -v
+pi --version
+python3 -m json.tool ~/.pi/agent/models.json
+pi --list-models qwen
+~~~
+
+最终必须全部满足：
+
+- Qwen监听127.0.0.1:8001；
 - 普通对话和<code>qwen3_xml</code>工具调用都通过；
+- Pi 0.86.1由普通Ubuntu用户安装和运行；
+- Node.js不低于22.19.0；
+- Pi能识别<code>qwen-local/qwen3-coder</code>；
+- one-shot请求返回<code>LOCAL_QWEN_OK</code>；
+- Pi能在安全目录中读取<code>test.txt</code>；
+- Pi能修改文件并读回验证；
+- Pi能运行、定位、修复并复测<code>calc.py</code>；
 - 64K稳定后才继续测试128K或262K。
 
-## 23. 官方参考资料
+## 31. 官方参考资料
 
+- [Pi Coding Agent仓库](https://github.com/earendil-works/pi)
+- [Pi自定义模型与vLLM配置](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md)
+- [Pi Coding Agent README](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md)
+- [Pi设置说明](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/settings.md)
+- [Pi Coding Agent npm包](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+- [nvm官方仓库](https://github.com/nvm-sh/nvm)
 - [vLLM v0.29.0 Release](https://github.com/vllm-project/vllm/releases/tag/v0.29.0)
 - [vLLM CUDA安装文档](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/)
 - [vLLM Tool Calling文档](https://docs.vllm.ai/en/latest/features/tool_calling/)

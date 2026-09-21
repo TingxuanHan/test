@@ -1063,52 +1063,256 @@ GEMMA_PORT
 
 ---
 
-## 故障排查：`Engine core initialization failed`
+## 故障排查：`nvcc` 与 CUDA Toolkit 版本不匹配
 
-`Engine core initialization failed` 只是外层结果，`leaked shared_memory` 通常是异常退出后的清理警告；真正根因应从前面的日志中查找。vLLM 的多 GPU 故障也可能最终只显示这类汇总错误。([GitHub][5])
+根因已经明确：
 
-无需重装环境，按以下顺序排查。
+> **vLLM/PyTorch 当前按 CUDA 13.x 构建扩展，但实际调用的 `nvcc` 并非匹配的 CUDA 13.x 编译器。**
 
-### 1. 确认基础环境
+vLLM 检测到 CUDA 编译器版本不低于 13.0 时会加入 `--compress-mode=size`，CUDA 13.0 的 `nvcc` 也确实支持该参数。([GitHub][5])
+
+因此，出现以下错误通常意味着实际执行的 `nvcc` 与 vLLM/PyTorch 识别的 CUDA Toolkit 版本不一致：
+
+```text
+nvcc fatal: Unknown option '--compress-mode=size'
+```
+
+CUDA 路径混用会直接导致扩展编译失败。([GitHub][6]) 无需重装 Qwen、vLLM 或 PyTorch，先按以下步骤确认并修正编译器路径。
+
+### 1. 检查 CUDA 编译器与 PyTorch
+
+在 Qwen 环境里：
 
 ```bash
 cd /mnt/data/txhan/qwen3-coder
 source .venv/bin/activate
+```
 
+然后：
+
+```bash
+which nvcc
+readlink -f "$(which nvcc)"
+nvcc --version
+```
+
+再：
+
+```bash
+echo "CUDA_HOME=$CUDA_HOME"
+```
+
+```bash
 python - <<'PY'
-import torch, vllm
+import torch
 print("torch:", torch.__version__)
-print("torch cuda:", torch.version.cuda)
-print("vllm:", vllm.__version__)
-print("cuda available:", torch.cuda.is_available())
-print("gpu count:", torch.cuda.device_count())
-for i in range(torch.cuda.device_count()):
-    print(i, torch.cuda.get_device_name(i))
+print("torch CUDA:", torch.version.cuda)
 PY
 ```
 
-这里应该至少是：
+再看机器上到底装了哪些 CUDA Toolkit：
+
+```bash
+ls -ld /usr/local/cuda*
+```
+
+最后：
+
+```bash
+nvidia-smi
+```
+
+你很可能会看到类似这种错配：
 
 ```text
-torch cuda: 13.0
-cuda available: True
-gpu count: 8
+PyTorch CUDA       13.0
+
+但
+
+which nvcc
+/usr/bin/nvcc
+
+nvcc --version
+CUDA 11.x / 12.x
 ```
+
+这就是问题。
 
 ---
 
-### 2. 使用单卡启动，判断是否为 TP=2 问题
+### 2. 已安装 `/usr/local/cuda-13.0`
 
-你的 FP8 Qwen 只有约 31GB，一张 96GB H20 完全能跑，所以单卡是最好的诊断基线。Qwen 官方也明确支持这个 FP8 checkpoint 用 vLLM。([Hugging Face][2])
+比如：
+
+```bash
+ls -ld /usr/local/cuda*
+```
+
+显示：
+
+```text
+/usr/local/cuda-12.4
+/usr/local/cuda-13.0
+/usr/local/cuda
+```
+
+那非常简单，**不需要重新安装任何东西**。
 
 执行：
 
 ```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+hash -r
+```
+
+然后验证：
+
+```bash
+which nvcc
+nvcc --version
+```
+
+必须看到类似：
+
+```text
+Cuda compilation tools, release 13.0
+```
+
+再直接测试这个参数：
+
+```bash
+nvcc --help | grep -A2 compress-mode
+```
+
+应该能够找到：
+
+```text
+--compress-mode
+```
+
+NVIDIA CUDA 13.0 官方文档明确列出了 `--compress-mode={default|size|speed|balance|none}`。([NVIDIA Docs][7])
+
+---
+
+### 3. 暂不修改系统 `/usr/local/cuda` 软链接
+
+执行：
+
+```bash
+ls -l /usr/local/cuda
+```
+
+可能你现在会发现：
+
+```text
+/usr/local/cuda -> /usr/local/cuda-11.8
+```
+
+或者：
+
+```text
+/usr/local/cuda -> /usr/local/cuda-12.2
+```
+
+但 PyTorch 已经是：
+
+```text
+CUDA 13.0
+```
+
+这就是典型的环境混用。
+
+我们**暂时不用修改全系统 symlink**。
+
+只给 Qwen 的启动环境指定：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+```
+
+这样不会影响机器上的其他项目。
+
+---
+
+### 4. 清理旧的 JIT 编译缓存
+
+因为前面已经失败过一次，建议把 Qwen 这次产生的临时编译结果清掉。
+
+先看：
+
+```bash
+du -sh ~/.cache/torch_extensions 2>/dev/null
+du -sh ~/.cache/vllm 2>/dev/null
+```
+
+> [!CAUTION]
+> `~/.cache/torch_extensions` 和 `~/.cache/vllm` 是当前用户的共享缓存，可能被其他项目使用。执行前确认没有相关任务运行，并核对目标路径；它们不是 Qwen 模型目录。
+
+确认后可清理：
+
+```bash
+rm -rf ~/.cache/torch_extensions
+```
+
+如果有 vLLM JIT cache：
+
+```bash
+rm -rf ~/.cache/vllm
+```
+
+注意这里是**编译缓存**，不是：
+
+```text
+/mnt/tydrive/txhan/models/Qwen...
+```
+
+不会删除模型。
+
+如果你当前实际上是 root 用户，那么 `~` 就是：
+
+```text
+/root
+```
+
+考虑到你刚发现 `/root` 里有大量旧缓存，这一点尤其要注意。
+
+---
+
+### 5. 使用最小配置重新启动
+
+我建议第一次仍然单卡，先验证 CUDA compiler：
+
+```bash
 export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
+
 export CUDA_VISIBLE_DEVICES=0
 export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
 export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
+```
 
+确认：
+
+```bash
+nvcc --version
+python -c "import torch; print(torch.version.cuda)"
+```
+
+两边最好都是：
+
+```text
+13.0
+```
+
+然后：
+
+```bash
 vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name qwen3-coder \
   --tensor-parallel-size 1 \
@@ -1119,229 +1323,81 @@ vllm serve "$QWEN_MODEL_DIR" \
   --port 8000
 ```
 
-我这里特意：
+如果这样能过：
 
-```text
-TP 2 → 1
-64K → 8K
-增加 --enforce-eager
-```
+> **CUDA / nvcc / FP8 / Qwen / vLLM 全部正常。**
 
-目的不是最终这么跑，而是尽量去掉：
-
-* NCCL/双卡通信
-* custom all-reduce
-* torch.compile / CUDA Graph
-* 大 KV cache
-
-这些变量。
-
-#### 如果单卡能成功启动
-
-那就说明：
-
-> **模型、FP8、PyTorch、CUDA、vLLM 基本没问题，问题集中在双卡通信路径。**
-
-这种情况下直接做第 3 步。
-
----
-
-### 3. 测试双卡并禁用 vLLM custom all-reduce
-
-执行：
+再回双卡：
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1
+```
 
+```bash
 vllm serve "$QWEN_MODEL_DIR" \
   --served-model-name qwen3-coder \
   --tensor-parallel-size 2 \
-  --max-model-len 8192 \
-  --gpu-memory-utilization 0.80 \
-  --enforce-eager \
-  --disable-custom-all-reduce \
+  --max-model-len 65536 \
+  --gpu-memory-utilization 0.85 \
   --host 0.0.0.0 \
   --port 8000
 ```
 
-`--disable-custom-all-reduce` 是 vLLM 官方支持的参数，它会禁用 vLLM 自己的 all-reduce kernel，退回 NCCL。([vLLM][6])
+---
 
-而且近期 vLLM 确实有多 GPU 场景因为 custom all-reduce 导致：
+### 6. 未安装 CUDA Toolkit 13.0
+
+那你现在的环境很可能是：
 
 ```text
-CUDA error
-→ worker退出
-→ Engine core initialization failed
-→ leaked shared_memory
+NVIDIA Driver
+支持 CUDA 13.x
+      ↓
+PyTorch cu130
+带 CUDA 13.0 runtime
+      ↓
+但是系统 CUDA Toolkit / nvcc
+还是旧版本
 ```
 
-这种几乎和你现在末尾表现一样的案例。([GitHub][5])
+这是完全可能的，因为：
 
-如果这一条成功，基本就已经定位了。
+> PyTorch wheel 带 CUDA runtime ≠ 系统已经安装 CUDA Toolkit/nvcc。
+
+vLLM 官方也明确要求，在需要编译 CUDA 扩展的环境下，正确设置 `CUDA_HOME` 并保证对应的 `nvcc` 在 PATH 中。([vLLM][1])
+
+这种情况下我们就需要**单独装 CUDA Toolkit 13.0**，但**不用碰显卡驱动**。
+
+千万不要为了这个直接执行整个 CUDA Driver 安装包，把现在能正常识别 8×H20 的 NVIDIA driver 给覆盖掉。
 
 ---
 
-### 4. 启用详细日志
+### 7. 当前应先确认的输出
 
-不要再只看最后三行。
-
-执行：
+现在最关键的是把下面这几条的输出看清楚：
 
 ```bash
-mkdir -p /mnt/data/txhan/qwen3-coder/logs
+which nvcc
+nvcc --version
+echo $CUDA_HOME
+ls -ld /usr/local/cuda*
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
 ```
 
-然后：
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1
-export VLLM_LOGGING_LEVEL=DEBUG
-export NCCL_DEBUG=INFO
-
-vllm serve "$QWEN_MODEL_DIR" \
-  --served-model-name qwen3-coder \
-  --tensor-parallel-size 2 \
-  --max-model-len 8192 \
-  --gpu-memory-utilization 0.80 \
-  --enforce-eager \
-  --disable-custom-all-reduce \
-  --host 0.0.0.0 \
-  --port 8000 \
-  2>&1 | tee /mnt/data/txhan/qwen3-coder/logs/startup-debug.log
-```
-
-vLLM 官方支持通过：
-
-```bash
-VLLM_LOGGING_LEVEL=DEBUG
-```
-
-提高日志级别。([vLLM][7])
-
-报错之后执行：
-
-```bash
-grep -nEi \
-'error|exception|traceback|runtimeerror|valueerror|cuda|nccl|oom|out of memory|unsupported|failed' \
-/mnt/data/txhan/qwen3-coder/logs/startup-debug.log \
-| tail -80
-```
-
-这比把最后：
+尤其是：
 
 ```text
-Engine core initialization failed
-leaked shared_memory
+nvcc --version
 ```
 
-贴出来有用得多。
+我基本判断它**不会是与你当前 PyTorch 匹配的 CUDA 13.0 nvcc**。
 
----
-
-### 5. 检查 `/dev/shm`
-
-执行：
-
-```bash
-df -h /dev/shm
-```
-
-正常物理机一般不会只有几十 MB。
-
-如果你看到：
-
-```text
-64M
-```
-
-那就很异常，常见于 Docker 默认共享内存配置。
-
-vLLM 的多进程确实使用 shared-memory broadcast；worker 卡死或初始化异常时也会伴随相关 SHM 报错。([GitHub][8])
-
----
-
-### 6. 检查 GPU 0、1 的拓扑连接
-
-```bash
-nvidia-smi topo -m
-```
-
-重点看 GPU0 ↔ GPU1。
-
-如果类似：
-
-```text
-GPU0 GPU1
-GPU0  X   NV#
-GPU1 NV#   X
-```
-
-很好。
-
-如果是：
-
-```text
-SYS
-PHB
-PXB
-```
-
-说明没有直接 NVLink/NVSwitch 通道，双卡 TP 更容易遇到通信相关问题。
-
----
-
-### 优先排查方向
-
-按照你目前的信息，我会优先怀疑：
-
-#### 第一嫌疑：双卡 custom all-reduce / NCCL 路径
-
-因为：
-
-```text
-模型能够开始 Engine 初始化
-→ 某个 worker 出错
-→ EngineCore整体失败
-→ shared_memory 来不及清理
-```
-
-而且现在 vLLM 确实存在多 GPU custom all-reduce 导致这种外层错误的近期案例。([GitHub][5])
-
-所以**最重要的测试就是这两个**：
-
-```text
-A：
-单卡 TP=1 + enforce-eager
-
-B：
-双卡 TP=2 + enforce-eager + disable-custom-all-reduce
-```
-
-结果可以直接把问题范围砍掉一大半。
-
-如果 **A 成功、B 成功**，我们后面就逐项恢复：
-
-```text
-8K
- ↓
-64K
- ↓
-去掉 enforce-eager
- ↓
-开启 prefix caching
- ↓
-最后 tool calling
-```
-
-不要一次把所有优化重新打开。
-
-如果 **A 都失败**，那就不是双卡问题了。此时把 `startup-debug.log` 中**从第一个真正的 `ERROR/Traceback` 开始，到 `Engine core initialization failed` 之前**那一段发给我；最后的 `leaked shared_memory` 不用发，我可以直接根据最前面的异常继续定位。
+如果它显示比如 **11.5、11.8、12.2、12.4**，下一步就非常明确了：**给 Qwen/vLLM 指定或安装 CUDA Toolkit 13.0，而不用重装前面那一大套环境。**
 
 [1]: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/ "GPU - vLLM"
 [2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
 [3]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
 [4]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/blob/main/config.json "config.json · Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
-[5]: https://github.com/vllm-project/vllm/issues/56180 "Failed: Cuda error /workspace/csrc/custom_all_reduce.cuh:164 invalid argument · Issue #56180 · vllm-project/vllm · GitHub"
-[6]: https://docs.vllm.ai/en/v0.28.0/cli/serve/ "serve - vLLM v0.28.0"
-[7]: https://docs.vllm.ai/en/stable/cli/serve/ "serve - vLLM"
-[8]: https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/shm_broadcast.py "shm_broadcast.py · vllm-project/vllm · GitHub"
+[5]: https://github.com/vllm-project/vllm/blob/main/CMakeLists.txt "CMakeLists.txt · vllm-project/vllm · GitHub"
+[6]: https://github.com/ggml-org/llama.cpp/issues/14260 "Compile bug: unrecognized command-line option compress-mode=size · Issue #14260 · ggml-org/llama.cpp · GitHub"
+[7]: https://docs.nvidia.com/cuda/archive/13.0.0/cuda-compiler-driver-nvcc/index.html "NVIDIA CUDA Compiler Driver 13.0 documentation"

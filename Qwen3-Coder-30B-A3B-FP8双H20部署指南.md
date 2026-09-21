@@ -1061,7 +1061,287 @@ GEMMA_PORT
 
 不会再发生模型之间环境变量互相覆盖的问题。
 
+---
+
+## 故障排查：`Engine core initialization failed`
+
+`Engine core initialization failed` 只是外层结果，`leaked shared_memory` 通常是异常退出后的清理警告；真正根因应从前面的日志中查找。vLLM 的多 GPU 故障也可能最终只显示这类汇总错误。([GitHub][5])
+
+无需重装环境，按以下顺序排查。
+
+### 1. 确认基础环境
+
+```bash
+cd /mnt/data/txhan/qwen3-coder
+source .venv/bin/activate
+
+python - <<'PY'
+import torch, vllm
+print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
+print("vllm:", vllm.__version__)
+print("cuda available:", torch.cuda.is_available())
+print("gpu count:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i))
+PY
+```
+
+这里应该至少是：
+
+```text
+torch cuda: 13.0
+cuda available: True
+gpu count: 8
+```
+
+---
+
+### 2. 使用单卡启动，判断是否为 TP=2 问题
+
+你的 FP8 Qwen 只有约 31GB，一张 96GB H20 完全能跑，所以单卡是最好的诊断基线。Qwen 官方也明确支持这个 FP8 checkpoint 用 vLLM。([Hugging Face][2])
+
+执行：
+
+```bash
+export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
+export CUDA_VISIBLE_DEVICES=0
+export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
+export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
+
+vllm serve "$QWEN_MODEL_DIR" \
+  --served-model-name qwen3-coder \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.80 \
+  --enforce-eager \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+我这里特意：
+
+```text
+TP 2 → 1
+64K → 8K
+增加 --enforce-eager
+```
+
+目的不是最终这么跑，而是尽量去掉：
+
+* NCCL/双卡通信
+* custom all-reduce
+* torch.compile / CUDA Graph
+* 大 KV cache
+
+这些变量。
+
+#### 如果单卡能成功启动
+
+那就说明：
+
+> **模型、FP8、PyTorch、CUDA、vLLM 基本没问题，问题集中在双卡通信路径。**
+
+这种情况下直接做第 3 步。
+
+---
+
+### 3. 测试双卡并禁用 vLLM custom all-reduce
+
+执行：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+
+vllm serve "$QWEN_MODEL_DIR" \
+  --served-model-name qwen3-coder \
+  --tensor-parallel-size 2 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.80 \
+  --enforce-eager \
+  --disable-custom-all-reduce \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+`--disable-custom-all-reduce` 是 vLLM 官方支持的参数，它会禁用 vLLM 自己的 all-reduce kernel，退回 NCCL。([vLLM][6])
+
+而且近期 vLLM 确实有多 GPU 场景因为 custom all-reduce 导致：
+
+```text
+CUDA error
+→ worker退出
+→ Engine core initialization failed
+→ leaked shared_memory
+```
+
+这种几乎和你现在末尾表现一样的案例。([GitHub][5])
+
+如果这一条成功，基本就已经定位了。
+
+---
+
+### 4. 启用详细日志
+
+不要再只看最后三行。
+
+执行：
+
+```bash
+mkdir -p /mnt/data/txhan/qwen3-coder/logs
+```
+
+然后：
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+export VLLM_LOGGING_LEVEL=DEBUG
+export NCCL_DEBUG=INFO
+
+vllm serve "$QWEN_MODEL_DIR" \
+  --served-model-name qwen3-coder \
+  --tensor-parallel-size 2 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.80 \
+  --enforce-eager \
+  --disable-custom-all-reduce \
+  --host 0.0.0.0 \
+  --port 8000 \
+  2>&1 | tee /mnt/data/txhan/qwen3-coder/logs/startup-debug.log
+```
+
+vLLM 官方支持通过：
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG
+```
+
+提高日志级别。([vLLM][7])
+
+报错之后执行：
+
+```bash
+grep -nEi \
+'error|exception|traceback|runtimeerror|valueerror|cuda|nccl|oom|out of memory|unsupported|failed' \
+/mnt/data/txhan/qwen3-coder/logs/startup-debug.log \
+| tail -80
+```
+
+这比把最后：
+
+```text
+Engine core initialization failed
+leaked shared_memory
+```
+
+贴出来有用得多。
+
+---
+
+### 5. 检查 `/dev/shm`
+
+执行：
+
+```bash
+df -h /dev/shm
+```
+
+正常物理机一般不会只有几十 MB。
+
+如果你看到：
+
+```text
+64M
+```
+
+那就很异常，常见于 Docker 默认共享内存配置。
+
+vLLM 的多进程确实使用 shared-memory broadcast；worker 卡死或初始化异常时也会伴随相关 SHM 报错。([GitHub][8])
+
+---
+
+### 6. 检查 GPU 0、1 的拓扑连接
+
+```bash
+nvidia-smi topo -m
+```
+
+重点看 GPU0 ↔ GPU1。
+
+如果类似：
+
+```text
+GPU0 GPU1
+GPU0  X   NV#
+GPU1 NV#   X
+```
+
+很好。
+
+如果是：
+
+```text
+SYS
+PHB
+PXB
+```
+
+说明没有直接 NVLink/NVSwitch 通道，双卡 TP 更容易遇到通信相关问题。
+
+---
+
+### 优先排查方向
+
+按照你目前的信息，我会优先怀疑：
+
+#### 第一嫌疑：双卡 custom all-reduce / NCCL 路径
+
+因为：
+
+```text
+模型能够开始 Engine 初始化
+→ 某个 worker 出错
+→ EngineCore整体失败
+→ shared_memory 来不及清理
+```
+
+而且现在 vLLM 确实存在多 GPU custom all-reduce 导致这种外层错误的近期案例。([GitHub][5])
+
+所以**最重要的测试就是这两个**：
+
+```text
+A：
+单卡 TP=1 + enforce-eager
+
+B：
+双卡 TP=2 + enforce-eager + disable-custom-all-reduce
+```
+
+结果可以直接把问题范围砍掉一大半。
+
+如果 **A 成功、B 成功**，我们后面就逐项恢复：
+
+```text
+8K
+ ↓
+64K
+ ↓
+去掉 enforce-eager
+ ↓
+开启 prefix caching
+ ↓
+最后 tool calling
+```
+
+不要一次把所有优化重新打开。
+
+如果 **A 都失败**，那就不是双卡问题了。此时把 `startup-debug.log` 中**从第一个真正的 `ERROR/Traceback` 开始，到 `Engine core initialization failed` 之前**那一段发给我；最后的 `leaked shared_memory` 不用发，我可以直接根据最前面的异常继续定位。
+
 [1]: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/ "GPU - vLLM"
 [2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
 [3]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
 [4]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/blob/main/config.json "config.json · Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
+[5]: https://github.com/vllm-project/vllm/issues/56180 "Failed: Cuda error /workspace/csrc/custom_all_reduce.cuh:164 invalid argument · Issue #56180 · vllm-project/vllm · GitHub"
+[6]: https://docs.vllm.ai/en/v0.28.0/cli/serve/ "serve - vLLM v0.28.0"
+[7]: https://docs.vllm.ai/en/stable/cli/serve/ "serve - vLLM"
+[8]: https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/shm_broadcast.py "shm_broadcast.py · vllm-project/vllm · GitHub"

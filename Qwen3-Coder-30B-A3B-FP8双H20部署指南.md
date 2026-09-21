@@ -1063,110 +1063,54 @@ GEMMA_PORT
 
 ---
 
-## 故障修复：安装正确的vLLM cu129 wheel
+## 故障修复：`uv`多索引解析与vLLM cu129 wheel安装
 
-根因已经确定：
+根因已经明确：
 
-> **PyTorch使用cu129，但当前安装的vLLM wheel是CUDA 13版本。**
+> **PyTorch已经是cu129，但`uv`的多索引解析策略导致vLLM cu129 wheel的依赖解析失败。**
 
-vLLM v0.29.0的PyPI默认包使用CUDA 13.0；CUDA 12.9需要安装release assets中单独提供的`+cu129` wheel。近期也有同类问题报告：`torch cu129`环境错误选择CUDA 13 vLLM artifact后，导入时会要求`libcudart.so.13`。([GitHub][5])
+安装cu129 vLLM时加入了PyTorch cu129索引。`uv`默认使用`first-index`策略：某个包名一旦在高优先级索引中出现，就只查看该索引里的版本。PyTorch cu129索引中的`packaging`最高为24.1，而`flashinfer-python==0.6.18`要求`packaging>=24.2`，因此解析失败。官方PyPI已提供`packaging 26.3`。([Astral Docs][5])
 
-当前`torch 2.13.0+cu129`及`torch.version.cuda = 12.9`是正确的；需要重建Qwen虚拟环境并明确安装vLLM v0.29.0的官方cu129 wheel。模型和系统CUDA 12.9无需重新安装。
-
-### 0. 重建Qwen环境并固定CUDA 12.9
-
-模型不需要重新下载。
-
-先固定缓存位置：
-
-```bash
-export UV_CACHE_DIR=/mnt/data/txhan/.cache/uv
-export PIP_CACHE_DIR=/mnt/data/txhan/.cache/pip
-export HF_HOME=/mnt/tydrive/txhan/.cache/huggingface
-export TMPDIR=/mnt/data/txhan/qwen3-coder/tmp
-
-export CUDA_HOME=/usr/local/cuda-12.9
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-hash -r
-```
-
-确认：
-
-```bash
-nvcc --version
-```
-
-应该是：
+当前环境中的PyTorch已经正确：
 
 ```text
-release 12.9
+torch 2.13.0+cu129
+CUDA 12.9
 ```
 
-然后重建环境：
+无需重建`.venv`。应先从PyPI安装满足要求的`packaging`，再使用`unsafe-best-match`跨索引解析并安装官方vLLM cu129 wheel。
 
-> [!CAUTION]
-> 以下操作只应删除 `/mnt/data/txhan/qwen3-coder/.venv`。执行前确认当前目录正确；Qwen模型目录不在该路径中。
+### 1. 激活现有环境
 
 ```bash
 cd /mnt/data/txhan/qwen3-coder
-
-deactivate 2>/dev/null || true
-rm -rf .venv
-
-uv venv .venv --python 3.10
 source .venv/bin/activate
 ```
 
----
-
-### 1. 不要再执行这条
-
-这次不要再用：
+### 2. 从PyPI安装新版`packaging`
 
 ```bash
-uv pip install vllm --torch-backend=cu129
+uv pip install "packaging>=24.2" \
+  --default-index https://pypi.org/simple
 ```
 
-虽然看起来指定了 cu129，但当前 vLLM 的 PyPI/release 生态存在 CUDA variant 解析容易混到默认 CUDA 13 wheel 的情况。vLLM 官方 release 明确把 PyPI 标为 CUDA 13.0，同时另行提供 CUDA 12.9 release artifact。([GitHub][5])
-
----
-
-### 2. 找到官方 v0.29.0 cu129 wheel
-
-直接让 GitHub API 告诉我们真实下载地址，避免我硬编码文件名：
+确认版本：
 
 ```bash
-curl -s https://api.github.com/repos/vllm-project/vllm/releases/tags/v0.29.0 \
-  | grep browser_download_url \
-  | grep cu129 \
-  | grep x86_64
+python -c "import packaging; print(packaging.__version__)"
 ```
 
-应该返回一个类似：
+建议看到：
 
 ```text
-https://github.com/vllm-project/vllm/releases/download/v0.29.0/...
-cu129...
-x86_64.whl
+26.3
 ```
 
-如果返回多个，查看：
-
-```bash
-curl -s https://api.github.com/repos/vllm-project/vllm/releases/tags/v0.29.0 \
-  | grep browser_download_url \
-  | grep '\.whl' \
-  | grep cu129
-```
-
-官方 v0.29.0 release 页面明确说明 CUDA 12.9 Python wheel 位于 release assets 中。([GitHub][5])
+官方PyPI当前提供`packaging 26.3`。([PyPI][6])
 
 ---
 
-### 3. 自动取 x86_64 cu129 wheel URL
-
-执行：
+### 3. 获取官方cu129 wheel地址
 
 ```bash
 VLLM_CU129_WHEEL=$( \
@@ -1186,282 +1130,176 @@ VLLM_CU129_WHEEL=$( \
 echo "$VLLM_CU129_WHEEL"
 ```
 
-必须看到一个：
+输出的URL必须同时包含：
 
 ```text
-https://github.com/vllm-project/vllm/releases/download/v0.29.0/...
-```
-
-并且里面有：
-
-```text
+v0.29.0
 cu129
+x86_64
 ```
 
-如果 `echo` 为空，先不要继续。
+如果变量为空，先不要继续。
 
----
-
-### 4. 安装真正的 cu129 vLLM
-
-执行：
+### 4. 使用`unsafe-best-match`安装
 
 ```bash
 uv pip install "$VLLM_CU129_WHEEL" \
-  --extra-index-url https://download.pytorch.org/whl/cu129
+  --default-index https://pypi.org/simple \
+  --index https://download.pytorch.org/whl/cu129 \
+  --index-strategy unsafe-best-match
 ```
 
-再：
+关键参数是：
 
 ```bash
-uv pip install huggingface_hub
+--index-strategy unsafe-best-match
 ```
 
-不要单独装 `torchaudio`。
+它会让`uv`在两个索引中比较可用版本，而不是在第一个包含`packaging`的索引中停止搜索。`uv`官方文档说明，默认`first-index`仅使用第一个包含该包的索引，`unsafe-best-match`则会跨索引选择合适版本。([Astral Docs][5])
 
 ---
 
-### 5. 第一轮验证：Torch
+### 5. 原因说明
+
+此前的解析链条是：
+
+```text
+PyTorch cu129 index
+        │
+        └── packaging最高只有24.1
+                         ↓
+uv默认first-index
+                         ↓
+不再查询PyPI
+                         ↓
+flashinfer-python 0.6.18
+要求packaging >=24.2
+                         ↓
+❌ Unsatisfiable
+```
+
+改用`unsafe-best-match`后：
+
+```text
+PyTorch cu129 index ─┐
+                     ├─ unsafe-best-match
+PyPI ────────────────┘
+                     ↓
+packaging 26.3
+                     ↓
+flashinfer-python 0.6.18
+                     ↓
+vLLM 0.29.0+cu129
+                     ↓
+✅
+```
+
+`flashinfer-python 0.6.18`可从官方PyPI获取。([PyPI][7])
+
+### 6. 安装后验证
+
+检查`packaging`：
+
+```bash
+python -c "import packaging; print('packaging:', packaging.__version__)"
+```
+
+检查PyTorch和CUDA：
+
+```bash
+python -c "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda)"
+```
+
+应保持：
+
+```text
+torch: 2.13.0+cu129
+CUDA: 12.9
+```
+
+检查相关包：
+
+```bash
+uv pip list | grep -Ei 'vllm|flashinfer|packaging|torch'
+```
+
+预期大致为：
+
+```text
+packaging           >=24.2
+flashinfer-python   0.6.18
+torch               2.13.0+cu129
+vllm                0.29.0+cu129
+```
+
+### 7. 检查CUDA 13污染并导入vLLM
+
+先检查依赖：
+
+```bash
+uv pip list | grep -Ei 'cu13|cuda|nvidia'
+```
+
+再执行最终导入测试：
 
 ```bash
 python - <<'PY'
 import torch
-
-print("torch =", torch.__version__)
-print("torch CUDA =", torch.version.cuda)
-print("CUDA available =", torch.cuda.is_available())
-print("GPU count =", torch.cuda.device_count())
-PY
-```
-
-应该是：
-
-```text
-torch = 2.13.0+cu129
-torch CUDA = 12.9
-CUDA available = True
-GPU count = 8
-```
-
----
-
-### 6. 再看有没有 CUDA 13 污染
-
-执行：
-
-```bash
-uv pip list | grep -Ei 'vllm|torch|cuda|cu13'
-```
-
-这里我们主要不希望再看到明显的 CUDA 13 runtime，例如：
-
-```text
-nvidia-cuda-runtime-cu13
-```
-
-那些：
-
-```text
-nvidia-cuda-nvcc 13.x
-nvidia-cuda-crt 13.x
-```
-
-在一个**全新 venv** 里如果仍然出现，也值得继续查来源；但真正决定 vLLM 是否可用的是其 `.so` 链接到哪个 libcudart。
-
----
-
-### 7. 最重要：检查 vLLM wheel 链接的是 CUDA 12 还是 13
-
-先不要直接 import。
-
-执行：
-
-```bash
-find .venv/lib/python3.10/site-packages/vllm \
-  -type f -name '*.so' -print0 |
-while IFS= read -r -d '' f; do
-    if readelf -d "$f" 2>/dev/null | grep -q libcudart; then
-        echo "=== $f ==="
-        readelf -d "$f" | grep libcudart
-    fi
-done
-```
-
-**正确 cu129 wheel 应该出现：**
-
-```text
-libcudart.so.12
-```
-
-不应该再看到：
-
-```text
-libcudart.so.13
-```
-
-vLLM 自己的近期 issue 也做了同样的验证：正确 cu129 artifact 依赖的是 `libcudart.so.12`，错误 fallback wheel 则依赖 `libcudart.so.13`。([GitHub][6])
-
----
-
-### 8. 然后才 import vLLM
-
-```bash
-python - <<'PY'
-import torch
-
 print("Torch:", torch.__version__)
 print("Torch CUDA:", torch.version.cuda)
 
 import vllm
-
 print("vLLM:", vllm.__version__)
-print("IMPORT SUCCESS")
+
+print("SUCCESS")
 PY
 ```
 
-目标：
+目标输出：
 
 ```text
-Torch: 2.13.0+cu129
 Torch CUDA: 12.9
-vLLM: 0.29.0
-IMPORT SUCCESS
+vLLM: 0.29.0+cu129
+SUCCESS
 ```
 
-如果这里成功：
-
-> `libcudart.so.13` 问题彻底解决。
-
----
-
-### 9. 清理旧编译缓存
-
-> [!CAUTION]
-> 以下目录是共享编译缓存，可能被其他Qwen、vLLM或root用户任务使用。确认没有相关进程运行并核对目标路径后再清理；执行`sudo rm -rf /root/...`前尤其应先备份或确认其中没有其他项目需要的缓存。
-
-```bash
-rm -rf /mnt/data/txhan/.cache/vllm/*
-rm -rf /mnt/data/txhan/.cache/torch_extensions/*
-```
-
-如果 `/root` 下还有以前残留：
-
-```bash
-sudo rm -rf /root/.cache/vllm
-sudo rm -rf /root/.cache/torch_extensions
-```
-
-不要碰：
+这表示此前的两个核心问题均已解决：
 
 ```text
-/mnt/tydrive/txhan/models/
+libcudart.so.13
+packaging<=24.1
 ```
 
----
+### 8. 暂时不要执行的命令
 
-### 10. 单卡启动
+不要执行：
 
 ```bash
-export QWEN_MODEL_DIR=/mnt/tydrive/txhan/models/Qwen3-Coder-30B-A3B-Instruct-FP8
-
-export CUDA_HOME=/usr/local/cuda-12.9
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-
-export CUDA_VISIBLE_DEVICES=0
+uv pip install -U vllm
 ```
 
-启动：
+否则可能重新安装默认CUDA 13版vLLM。
+
+也不要执行：
 
 ```bash
-vllm serve "$QWEN_MODEL_DIR" \
-  --served-model-name qwen3-coder \
-  --tensor-parallel-size 1 \
-  --max-model-len 8192 \
-  --gpu-memory-utilization 0.80 \
-  --enforce-eager \
-  --host 0.0.0.0 \
-  --port 8001
+uv pip install vllm --torch-backend=auto
 ```
 
-这次重点观察：
-
-```text
-ImportError: libcudart.so.13
-```
-
-是否彻底消失。
-
----
-
-### 11. 单卡成功再双卡
-
-```bash
-export CUDA_VISIBLE_DEVICES=0,1
-```
-
-然后：
-
-```bash
-vllm serve "$QWEN_MODEL_DIR" \
-  --served-model-name qwen3-coder \
-  --tensor-parallel-size 2 \
-  --max-model-len 8192 \
-  --gpu-memory-utilization 0.80 \
-  --enforce-eager \
-  --host 0.0.0.0 \
-  --port 8001
-```
-
-成功以后才改：
-
-```bash
---max-model-len 65536
-```
-
-最后才去掉：
-
-```bash
---enforce-eager
-```
-
-再最后才加 Agent 参数。
-
----
-
-### 根因链条
-
-你之前实际上是：
+当前应明确保持：
 
 ```text
 CUDA Toolkit 12.9
-       │
-       ├── nvcc 12.9
-       │
-       └── PyTorch 2.13 cu129   ✅
-                    │
-                    │
-             vLLM PyPI wheel
-                    │
-               CUDA 13.0 ❌
-                    │
-              libcudart.so.13
-                    │
-          系统找不到 → ImportError
+PyTorch cu129
+vLLM 0.29.0+cu129
 ```
 
-这不是“CUDA 12.9 配错了”，而是**vLLM wheel variant 装错了**。
-
-而且这与 vLLM 近期公开 issue 的表现高度一致：cu129 PyTorch 环境里意外选到 CUDA 13 vLLM artifact，最终就是 `libcudart.so.13`。([GitHub][7])
-
-所以这次不要再折腾系统 CUDA，也**不要安装 CUDA 13**。核心就是：
-
-> **明确安装 vLLM v0.29.0 的官方 cu129 release wheel，而不是默认 PyPI wheel。**
+确认`import vllm`成功后，再按前文步骤启动Qwen；此时无需重建环境。
 
 [1]: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/ "GPU - vLLM"
 [2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
 [3]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
 [4]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/blob/main/config.json "config.json · Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
-[5]: https://github.com/vllm-project/vllm/releases "Releases · vllm-project/vllm · GitHub"
-[6]: https://github.com/vllm-project/vllm/issues/52544 "VLLM_USE_PRECOMPILED can fall back across CUDA variants without compatibility validation · Issue #52544 · GitHub"
-[7]: https://github.com/vllm-project/vllm/issues/42338 "cu129 Nightly Installation Resolves to CUDA 13 Wheel · Issue #42338 · GitHub"
+[5]: https://docs.astral.sh/uv/reference/cli/ "uv CLI reference · Astral Docs"
+[6]: https://pypi.org/project/packaging/ "packaging · PyPI"
+[7]: https://pypi.org/project/flashinfer-python/0.6.18/ "flashinfer-python 0.6.18 · PyPI"

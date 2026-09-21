@@ -1063,243 +1063,243 @@ GEMMA_PORT
 
 ---
 
-## 故障修复：`uv`多索引解析与vLLM cu129 wheel安装
+## 故障修复：通过固定URL安装vLLM cu129 wheel
 
-根因已经明确：
-
-> **PyTorch已经是cu129，但`uv`的多索引解析策略导致vLLM cu129 wheel的依赖解析失败。**
-
-安装cu129 vLLM时加入了PyTorch cu129索引。`uv`默认使用`first-index`策略：某个包名一旦在高优先级索引中出现，就只查看该索引里的版本。PyTorch cu129索引中的`packaging`最高为24.1，而`flashinfer-python==0.6.18`要求`packaging>=24.2`，因此解析失败。官方PyPI已提供`packaging 26.3`。([Astral Docs][5])
-
-当前环境中的PyTorch已经正确：
+GitHub API自动获取wheel地址的命令没有返回资产列表，因此不再动态解析URL，改为直接使用已确定的v0.29.0 cu129 x86_64 wheel：
 
 ```text
-torch 2.13.0+cu129
-CUDA 12.9
+vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
 ```
 
-无需重建`.venv`。应先从PyPI安装满足要求的`packaging`，再使用`unsafe-best-match`跨索引解析并安装官方vLLM cu129 wheel。
+该文件约548.5MB。([SourceForge][5]) 下载地址指向vLLM官方GitHub release，不需要更改CUDA Toolkit，也不需要重建现有`.venv`。
 
-### 1. 激活现有环境
+### 1. 确认服务器架构
+
+```bash
+uname -m
+```
+
+H20服务器通常应返回：
+
+```text
+x86_64
+```
+
+只有确认是`x86_64`后，才继续使用下面的wheel。
+
+### 2. 将wheel下载到700GB数据盘
+
+```bash
+mkdir -p /mnt/data/txhan/qwen3-coder/wheels
+cd /mnt/data/txhan/qwen3-coder/wheels
+```
+
+优先使用编码了`+`号的URL：
+
+```bash
+wget -c \
+'https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0%2Bcu129-cp38-abi3-manylinux_2_28_x86_64.whl'
+```
+
+如果`wget`不识别`%2B`，可改用：
+
+```bash
+wget -c \
+'https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl'
+```
+
+下载完成后检查：
+
+```bash
+ls -lh
+```
+
+应看到大约：
+
+```text
+549M vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+```
+
+### 3. 先解决`packaging<=24.1`冲突
+
+激活现有环境：
 
 ```bash
 cd /mnt/data/txhan/qwen3-coder
 source .venv/bin/activate
 ```
 
-### 2. 从PyPI安装新版`packaging`
+明确从官方PyPI安装新版`packaging`：
 
 ```bash
-uv pip install "packaging>=24.2" \
-  --default-index https://pypi.org/simple
-```
-
-确认版本：
-
-```bash
-python -c "import packaging; print(packaging.__version__)"
-```
-
-建议看到：
-
-```text
-26.3
-```
-
-官方PyPI当前提供`packaging 26.3`。([PyPI][6])
-
----
-
-### 3. 获取官方cu129 wheel地址
-
-```bash
-VLLM_CU129_WHEEL=$( \
-  curl -s https://api.github.com/repos/vllm-project/vllm/releases/tags/v0.29.0 \
-  | grep browser_download_url \
-  | grep cu129 \
-  | grep x86_64 \
-  | grep '\.whl' \
-  | head -1 \
-  | cut -d '"' -f 4 \
-)
+uv pip install \
+  --default-index https://pypi.org/simple \
+  'packaging>=24.2'
 ```
 
 检查：
 
 ```bash
-echo "$VLLM_CU129_WHEEL"
+python -c "import packaging; print(packaging.__version__)"
 ```
 
-输出的URL必须同时包含：
+版本不低于24.2即可。
 
-```text
-v0.29.0
-cu129
-x86_64
-```
+### 4. 直接安装本地cu129 wheel
 
-如果变量为空，先不要继续。
-
-### 4. 使用`unsafe-best-match`安装
+不要再让`uv`自动选择vLLM wheel，直接安装刚下载的本地文件：
 
 ```bash
-uv pip install "$VLLM_CU129_WHEEL" \
+uv pip install \
+  /mnt/data/txhan/qwen3-coder/wheels/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl \
   --default-index https://pypi.org/simple \
   --index https://download.pytorch.org/whl/cu129 \
   --index-strategy unsafe-best-match
 ```
 
-关键参数是：
-
-```bash
---index-strategy unsafe-best-match
-```
-
-它会让`uv`在两个索引中比较可用版本，而不是在第一个包含`packaging`的索引中停止搜索。`uv`官方文档说明，默认`first-index`仅使用第一个包含该包的索引，`unsafe-best-match`则会跨索引选择合适版本。([Astral Docs][5])
-
----
-
-### 5. 原因说明
-
-此前的解析链条是：
+三个来源的作用分别是：
 
 ```text
+本地wheel
+→ 强制vLLM使用cu129
+
+PyPI
+→ 提供packaging、flashinfer等普通依赖
+
 PyTorch cu129 index
-        │
-        └── packaging最高只有24.1
-                         ↓
-uv默认first-index
-                         ↓
-不再查询PyPI
-                         ↓
-flashinfer-python 0.6.18
-要求packaging >=24.2
-                         ↓
-❌ Unsatisfiable
+→ 提供torch及CUDA相关Python wheel
 ```
 
-改用`unsafe-best-match`后：
+vLLM v0.29.0的默认PyPI wheel使用CUDA 13，而cu129 wheel作为release asset单独提供，因此这里固定本地asset，避免重新安装cu13版本。([GitHub][6])
+
+### 5. 依赖仍冲突时分两步安装
+
+如果仍卡在`packaging`解析，先安装普通依赖：
+
+```bash
+uv pip install \
+  --default-index https://pypi.org/simple \
+  'packaging>=24.2' \
+  'flashinfer-python==0.6.18'
+```
+
+检查：
+
+```bash
+uv pip list | grep -E 'packaging|flashinfer'
+```
+
+然后再次安装本地wheel：
+
+```bash
+uv pip install \
+  /mnt/data/txhan/qwen3-coder/wheels/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl \
+  --default-index https://pypi.org/simple \
+  --index https://download.pytorch.org/whl/cu129 \
+  --index-strategy unsafe-best-match
+```
+
+### 6. 安装后检查包版本
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+应继续保持：
 
 ```text
-PyTorch cu129 index ─┐
-                     ├─ unsafe-best-match
-PyPI ────────────────┘
-                     ↓
-packaging 26.3
-                     ↓
-flashinfer-python 0.6.18
-                     ↓
-vLLM 0.29.0+cu129
-                     ↓
-✅
+2.13.0+cu129 12.9
 ```
 
-`flashinfer-python 0.6.18`可从官方PyPI获取。([PyPI][7])
-
-### 6. 安装后验证
-
-检查`packaging`：
+再检查相关包：
 
 ```bash
-python -c "import packaging; print('packaging:', packaging.__version__)"
+uv pip list | grep -Ei 'vllm|torch|flashinfer|packaging'
 ```
 
-检查PyTorch和CUDA：
-
-```bash
-python -c "import torch; print('torch:', torch.__version__); print('CUDA:', torch.version.cuda)"
-```
-
-应保持：
+重点应看到：
 
 ```text
-torch: 2.13.0+cu129
-CUDA: 12.9
+vllm               0.29.0+cu129
+torch              2.13.0+cu129
+flashinfer-python  0.6.18
+packaging          >=24.2
 ```
 
-检查相关包：
-
-```bash
-uv pip list | grep -Ei 'vllm|flashinfer|packaging|torch'
-```
-
-预期大致为：
-
-```text
-packaging           >=24.2
-flashinfer-python   0.6.18
-torch               2.13.0+cu129
-vllm                0.29.0+cu129
-```
-
-### 7. 检查CUDA 13污染并导入vLLM
-
-先检查依赖：
-
-```bash
-uv pip list | grep -Ei 'cu13|cuda|nvidia'
-```
-
-再执行最终导入测试：
+### 7. 启动前先导入vLLM
 
 ```bash
 python - <<'PY'
 import torch
+
 print("Torch:", torch.__version__)
 print("Torch CUDA:", torch.version.cuda)
 
 import vllm
-print("vLLM:", vllm.__version__)
 
-print("SUCCESS")
+print("vLLM:", vllm.__version__)
+print("IMPORT SUCCESS")
 PY
 ```
 
 目标输出：
 
 ```text
+Torch: 2.13.0+cu129
 Torch CUDA: 12.9
 vLLM: 0.29.0+cu129
-SUCCESS
+IMPORT SUCCESS
 ```
 
-这表示此前的两个核心问题均已解决：
+如果导入成功，之前的`libcudart.so.13`问题应已消失。
+
+### 8. 确认wheel没有链接CUDA 13
+
+```bash
+find /mnt/data/txhan/qwen3-coder/.venv/lib/python3.10/site-packages/vllm \
+  -type f -name '*.so' -print0 |
+while IFS= read -r -d '' f; do
+    x=$(readelf -d "$f" 2>/dev/null | grep libcudart || true)
+    if [ -n "$x" ]; then
+        echo "=== $f ==="
+        echo "$x"
+    fi
+done
+```
+
+正常cu129 wheel应链接：
+
+```text
+libcudart.so.12
+```
+
+不应再看到：
 
 ```text
 libcudart.so.13
-packaging<=24.1
 ```
 
-### 8. 暂时不要执行的命令
+### 9. 停止使用自动URL发现
 
-不要执行：
+无需再执行：
 
 ```bash
-uv pip install -U vllm
+VLLM_CU129_WHEEL=$(curl ...)
 ```
 
-否则可能重新安装默认CUDA 13版vLLM。
-
-也不要执行：
-
-```bash
-uv pip install vllm --torch-backend=auto
-```
-
-当前应明确保持：
+直接固定使用：
 
 ```text
-CUDA Toolkit 12.9
-PyTorch cu129
-vLLM 0.29.0+cu129
+vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
 ```
 
-确认`import vllm`成功后，再按前文步骤启动Qwen；此时无需重建环境。
+wheel从vLLM GitHub release URL下载；镜像页也列出了相同文件。([SourceForge][5])
+
+如果第4步仍出现依赖冲突，请保留从`× No solution found`开始到结尾的完整错误输出。此时无需再修改CUDA Toolkit，剩余问题仅位于Python依赖解析层。
 
 [1]: https://docs.vllm.ai/en/stable/getting_started/installation/gpu/ "GPU - vLLM"
 [2]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/tree/main "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
 [3]: https://docs.vllm.ai/en/latest/features/tool_calling/ "Tool Calling - vLLM"
 [4]: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8/blob/main/config.json "config.json · Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 at main"
-[5]: https://docs.astral.sh/uv/reference/cli/ "uv CLI reference · Astral Docs"
-[6]: https://pypi.org/project/packaging/ "packaging · PyPI"
-[7]: https://pypi.org/project/flashinfer-python/0.6.18/ "flashinfer-python 0.6.18 · PyPI"
+[5]: https://sourceforge.net/projects/vllm.mirror/files/v0.29.0/ "vLLM v0.29.0 files · SourceForge"
+[6]: https://github.com/vllm-project/vllm/releases "Releases · vllm-project/vllm · GitHub"

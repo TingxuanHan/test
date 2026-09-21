@@ -351,26 +351,34 @@ vllm                0.29.0+cu129
 
 ~~~bash
 python - <<'PY'
+from importlib.metadata import version as distribution_version
+
 import packaging
 import torch
 import vllm
+
+vllm_package_version = distribution_version("vllm")
 
 print("packaging:", packaging.__version__)
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
 print("CUDA available:", torch.cuda.is_available())
 print("GPU count:", torch.cuda.device_count())
-print("vLLM:", vllm.__version__)
+print("vLLM module:", vllm.__version__)
+print("vLLM package:", vllm_package_version)
 
 assert tuple(map(int, packaging.__version__.split(".")[:2])) >= (24, 2)
 assert torch.__version__ == "2.13.0+cu129"
 assert torch.version.cuda == "12.9"
 assert torch.cuda.is_available()
-assert vllm.__version__ == "0.29.0+cu129"
+assert vllm.__version__ == "0.29.0", vllm.__version__
+assert vllm_package_version == "0.29.0+cu129", vllm_package_version
 
 print("CUDA 12.9 STACK VERIFIED")
 PY
 ~~~
+
+<code>vllm.__version__</code>只报告基础模块版本<code>0.29.0</code>，不一定包含wheel的本地版本后缀。<code>importlib.metadata</code>读取的发行包版本才用于确认安装的是<code>0.29.0+cu129</code>。不要把模块版本必须带<code>+cu129</code>写成断言，否则正确环境也会触发<code>AssertionError: 0.29.0</code>。
 
 ### 7.3 检查vLLM动态库链接
 
@@ -662,16 +670,22 @@ mkdir -p \
 source "$QWEN_WORKDIR/.venv/bin/activate"
 
 python - <<'PY'
+from importlib.metadata import version as distribution_version
+
 import torch
 import vllm
 
+vllm_package_version = distribution_version("vllm")
+
 assert torch.__version__ == "2.13.0+cu129", torch.__version__
 assert torch.version.cuda == "12.9", torch.version.cuda
-assert vllm.__version__ == "0.29.0+cu129", vllm.__version__
+assert vllm.__version__ == "0.29.0", vllm.__version__
+assert vllm_package_version == "0.29.0+cu129", vllm_package_version
 
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
-print("vLLM:", vllm.__version__)
+print("vLLM module:", vllm.__version__)
+print("vLLM package:", vllm_package_version)
 PY
 
 exec vllm serve "$QWEN_MODEL_DIR" \
@@ -687,6 +701,8 @@ exec vllm serve "$QWEN_MODEL_DIR" \
   --host 127.0.0.1 \
   --port "$QWEN_PORT"
 ~~~
+
+脚本故意分别检查<code>vllm.__version__</code>和发行包版本：前者应为<code>0.29.0</code>，后者应为<code>0.29.0+cu129</code>。如果模块版本只显示<code>0.29.0</code>，这是正常现象，不代表安装成了错误的CUDA wheel。
 
 保存后加执行权限：
 
@@ -1293,7 +1309,17 @@ tail -n 100 /mnt/data/txhan/qwen3-coder/logs/qwen.log
 ~~~bash
 source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
 
-python -c "import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__)"
+python - <<'PY'
+from importlib.metadata import version as distribution_version
+import torch
+import vllm
+
+print("torch:", torch.__version__)
+print("torch CUDA:", torch.version.cuda)
+print("vLLM module:", vllm.__version__)
+print("vLLM package:", distribution_version("vllm"))
+PY
+
 echo "$LD_LIBRARY_PATH"
 ~~~
 
@@ -1470,11 +1496,14 @@ nvcc --version
 source /mnt/data/txhan/qwen3-coder/.venv/bin/activate
 
 python - <<'PY'
+from importlib.metadata import version as distribution_version
 import torch
 import vllm
+
 print("torch:", torch.__version__)
 print("torch CUDA:", torch.version.cuda)
-print("vLLM:", vllm.__version__)
+print("vLLM module:", vllm.__version__)
+print("vLLM package:", distribution_version("vllm"))
 print("CUDA available:", torch.cuda.is_available())
 print("GPU count:", torch.cuda.device_count())
 PY
@@ -1487,7 +1516,8 @@ uv pip check
 - <code>nvcc</code>是12.9；
 - <code>torch</code>是2.13.0+cu129；
 - <code>torch.version.cuda</code>是12.9；
-- <code>vLLM</code>是0.29.0+cu129；
+- <code>vllm.__version__</code>是0.29.0；
+- vLLM发行包版本是0.29.0+cu129；
 - vLLM动态库不依赖<code>libcudart.so.13</code>；
 - 两张H20都在工作；
 - Qwen只使用<code>QWEN_MODEL_DIR</code>、<code>QWEN_WORKDIR</code>和<code>QWEN_PORT</code>；

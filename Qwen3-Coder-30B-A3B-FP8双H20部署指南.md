@@ -722,6 +722,14 @@ bash -n /mnt/data/txhan/qwen3-coder/start_qwen.sh
 /mnt/data/txhan/qwen3-coder/start_qwen.sh
 ~~~
 
+这里是前台测试启动。完成第14节API验证后，如果准备在第16节改用tmux常驻，请先回到当前终端按<code>Ctrl+C</code>停止这个测试实例，并确认8001端口已经释放：
+
+~~~bash
+ss -ltnp | grep ':8001' || echo "8001 is free"
+~~~
+
+如果保留当前实例继续运行，第16节就不要再次执行<code>start_qwen.sh</code>，否则会因为两个vLLM实例争用8001端口而出现<code>Address already in use</code>。
+
 这个脚本没有读取或修改DeepSeek使用的<code>MODEL_DIR</code>。
 
 ## 14. API验证
@@ -869,7 +877,20 @@ pi
 
 ## 16. 启动Qwen并确认工具调用模式
 
-Pi接入前，先启动第13节生成的固定脚本。推荐在tmux中运行：
+Pi接入前，先检查8001端口，避免重复启动第13节仍在运行的测试实例：
+
+~~~bash
+ss -ltnp | grep ':8001' || true
+curl -fsS http://127.0.0.1:8001/v1/models || true
+~~~
+
+根据结果分三种情况处理：
+
+1. 如果curl正常返回并包含<code>qwen3-coder</code>，说明Qwen已经在运行。不要再次启动，直接继续本节后面的工具参数检查和第17节。
+2. 如果这是第13节留在前台的Qwen，而且希望迁移到tmux，回到原终端按<code>Ctrl+C</code>正常停止，再确认8001已释放。
+3. 如果8001被其他或不明进程占用，先按第27.10节确认进程身份，不要直接执行<code>kill -9</code>或批量清理端口。
+
+只有确认8001没有监听进程时，才在tmux中启动：
 
 ~~~bash
 tmux new -s qwen
@@ -879,6 +900,13 @@ tmux new -s qwen
 ~~~
 
 看到服务完成加载后，按<code>Ctrl+B</code>，再按<code>D</code>退出tmux但保持服务运行。
+
+如果<code>tmux new -s qwen</code>提示会话已存在，不要创建重复会话，执行：
+
+~~~bash
+tmux ls
+tmux attach -t qwen
+~~~
 
 在另一个Ubuntu终端验证：
 
@@ -1398,15 +1426,48 @@ ls -l
 
 Pi只能使用当前用户已有的文件权限。不要通过<code>sudo pi</code>解决；应先确认项目所有者和目标路径，再对单个必要目录做最小权限修复。
 
-### 27.10 端口8001占用或模型下载不完整
+### 27.10 Address already in use或端口8001被占用
 
-检查占用者：
+该错误表示已经有进程监听<code>127.0.0.1:8001</code>。最常见原因是第13步启动的前台Qwen还没有停止，第16步又尝试启动第二个实例。
+
+先检查服务是否就是已经正常运行的Qwen：
 
 ~~~bash
 ss -ltnp | grep ':8001'
+curl -fsS http://127.0.0.1:8001/v1/models || true
 ~~~
 
-确认进程后再停止旧Qwen实例或调整Qwen专属端口，不要误停DeepSeek。
+如果curl返回的模型列表包含<code>qwen3-coder</code>，无需处理端口，也不要再次启动服务，直接继续配置Pi。
+
+如果要把已有前台实例迁移到tmux，优先回到启动它的终端按<code>Ctrl+C</code>。如果原终端已经找不到，先取得监听进程PID：
+
+~~~bash
+sudo ss -ltnp 'sport = :8001'
+~~~
+
+将输出中的实际PID填入下面的变量，再检查进程命令行：
+
+~~~bash
+QWEN_LISTENER_PID=12345  # 替换为上一步看到的实际PID
+
+ps -fp "$QWEN_LISTENER_PID"
+sudo tr '\0' ' ' < "/proc/$QWEN_LISTENER_PID/cmdline"
+echo
+~~~
+
+只有在命令行明确显示它是本文的<code>vllm serve</code>、模型是<code>Qwen3-Coder-30B-A3B-Instruct-FP8</code>且端口是8001时，才优雅停止：
+
+~~~bash
+kill -TERM "$QWEN_LISTENER_PID"
+sleep 3
+ss -ltnp | grep ':8001' || echo "8001 is free"
+~~~
+
+端口释放后再执行第16节的tmux启动命令。不要直接运行<code>kill -9</code>、<code>pkill -f vllm</code>或<code>fuser -k 8001/tcp</code>，这些命令可能误伤其他模型服务。
+
+如果占用者不是Qwen，不要停止它。应先确认该服务用途，再决定释放8001，或者把<code>QWEN_PORT</code>、<code>start_qwen.sh</code>、Pi的<code>baseUrl</code>和SSH隧道统一改到另一个空闲端口。不能只修改其中一处。
+
+### 27.11 模型下载不完整
 
 模型不完整时可重复断点下载：
 

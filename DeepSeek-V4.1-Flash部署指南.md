@@ -399,26 +399,52 @@ sudo apt install -y \
     docker-compose-plugin
 ```
 
-当前用户加入 Docker：
+默认采用更可审计的方式：普通用户不加入<code>docker</code>组，每条访问Docker daemon的命令显式使用<code>sudo docker</code>。
 
-```bash
+检查服务和权限：
+
+~~~bash
+sudo systemctl is-active docker
+ls -l /var/run/docker.sock
+id -nG
+sudo docker ps
+~~~
+
+如果<code>sudo docker ps</code>成功，而不带sudo时报<code>permission denied while trying to connect to the Docker daemon socket</code>，说明只是当前用户无权访问Docker socket。本文后续命令已经统一使用sudo，不需要修改socket权限，也不要执行<code>chmod 666 /var/run/docker.sock</code>。
+
+不要把“加入docker组”理解为更安全。Docker官方明确说明，<code>docker</code>组授予接近root级别的权限；永久加入后，当前登录会话中的程序也能访问Docker socket。([Docker Docs][9])
+
+如果你接受这一权限边界并且确实需要免sudo，可以选择：
+
+~~~bash
 sudo usermod -aG docker "$USER"
-```
+~~~
 
-当前 shell 生效：
+然后必须完全退出当前SSH登录并重新登录，再验证：
 
-```bash
-newgrp docker
-```
-
-测试：
-
-```bash
+~~~bash
+id -nG
 docker ps
-```
+~~~
+
+不要仅依赖新开一个终端判断组权限是否生效。若以后要恢复默认的sudo模式：
+
+~~~bash
+sudo gpasswd --delete "$USER" docker
+~~~
+
+随后完全退出并重新登录。真正降低daemon权限需要使用Docker Rootless mode，但它会改变daemon、存储和NVIDIA GPU运行时配置；本指南的8×H20稳定路线不混用Rootless模式。
+
+如果以前混用sudo与免sudo导致<code>~/.docker</code>归root所有，可修复当前用户配置目录：
+
+~~~bash
+if [ -d "$HOME/.docker" ]; then
+  sudo chown -R "$USER:$USER" "$HOME/.docker"
+  sudo chmod -R u+rwX,go-rwx "$HOME/.docker"
+fi
+~~~
 
 ---
-
 # 9. 检查 NVIDIA Container Toolkit
 
 先：
@@ -508,11 +534,11 @@ grep -F '/mnt/tydrive' /etc/fstab || true
 ~~~bash
 mkdir -p /mnt/tydrive/txhan/DeepSeek/migration-backup
 
-docker info --format 'DockerRootDir={{.DockerRootDir}}'
-docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
-docker ps -a --no-trunc \
+sudo docker info --format 'DockerRootDir={{.DockerRootDir}}'
+sudo docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+sudo docker ps -a --no-trunc \
   | tee /mnt/tydrive/txhan/DeepSeek/migration-backup/docker-ps-before.txt
-docker images --digests \
+sudo docker images --digests \
   | tee /mnt/tydrive/txhan/DeepSeek/migration-backup/docker-images-before.txt
 
 sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
@@ -704,8 +730,8 @@ sudo systemctl start docker.service
 ~~~bash
 sudo systemctl --no-pager --full status containerd.service docker.service
 
-docker info --format 'DockerRootDir={{.DockerRootDir}}'
-docker info --format 'LoggingDriver={{.LoggingDriver}}'
+sudo docker info --format 'DockerRootDir={{.DockerRootDir}}'
+sudo docker info --format 'LoggingDriver={{.LoggingDriver}}'
 sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
 
 df -hT / /mnt/tydrive
@@ -757,7 +783,7 @@ df -h /
 现在执行的第一次镜像拉取应直接写入<code>/mnt/tydrive</code>：
 
 ~~~bash
-docker run --rm \
+sudo docker run --rm \
     --gpus all \
     nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04 \
     nvidia-smi
@@ -777,10 +803,10 @@ GPU 7 H20
 再次复核容器存储和系统盘：
 
 ~~~bash
-docker info --format 'DockerRootDir={{.DockerRootDir}}'
-docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
-docker info --format 'LoggingDriver={{.LoggingDriver}}'
-docker system df
+sudo docker info --format 'DockerRootDir={{.DockerRootDir}}'
+sudo docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+sudo docker info --format 'LoggingDriver={{.LoggingDriver}}'
+sudo docker system df
 
 sudo du -sh /mnt/tydrive/docker-data /mnt/tydrive/containerd-data
 sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
@@ -790,44 +816,192 @@ df -hT / /mnt/tydrive
 必须确认Docker root位于<code>/mnt/tydrive/docker-data</code>。如果<code>DriverStatus</code>显示<code>io.containerd.snapshotter.v1</code>，镜像和快照还必须落在<code>/mnt/tydrive/containerd-data</code>。此后Docker镜像、容器可写层、卷、BuildKit缓存和容器日志都不再以系统盘为主要存储位置。
 
 ---
-# 12. 拉取 vLLM nightly
+# 12. 修复Docker Hub超时并拉取vLLM nightly
 
-这一点现在很重要。
+镜像标签必须准确写成：
 
-拉取前必须再次确认Docker和containerd都已切换到数据盘：
+~~~text
+vllm/vllm-openai:nightly
+~~~
+
+不要写成<code>nigbhtly</code>。但下面这类错误发生在访问Docker Hub网关阶段，还没有进入标签校验，因此根因通常是网络、DNS或代理：
+
+~~~text
+Error response from daemon:
+Get "https://registry-1.docker.io/v2/": gateway timeout
+~~~
+
+### 12.1 先区分Docker Hub故障和本机网络问题
+
+可先查看[Docker官方状态页](https://www.dockerstatus.com/)。再在服务器执行：
 
 ~~~bash
-docker info --format 'DockerRootDir={{.DockerRootDir}}'
+getent ahosts registry-1.docker.io
+
+curl -sS -D - -o /dev/null \
+  --connect-timeout 15 \
+  https://registry-1.docker.io/v2/
+~~~
+
+正常可达时通常返回<code>401 Unauthorized</code>和<code>WWW-Authenticate</code>响应头；401在这里是正常的，它说明DNS、TCP和TLS已经连通，后续由Docker完成令牌认证。
+
+如果这里仍然是<code>gateway timeout</code>、<code>connection timed out</code>或无法解析域名，先检查服务器网络和代理，不要反复重装Docker或删除镜像目录。
+
+检查当前Shell与Docker daemon的代理来源：
+
+~~~bash
+env | grep -iE '^(http|https|no|all)_proxy=' || true
+sudo systemctl show docker --property=Environment
+sudo systemctl cat docker
+sudo journalctl -u docker --since '-15 min' --no-pager
+~~~
+
+这些输出可能包含代理用户名或密码。只在本机查看；向他人发送日志前必须遮掉凭据。
+
+### 12.2 服务器必须通过代理访问外网时
+
+Shell中的<code>HTTP_PROXY</code>不会自动成为Docker daemon的代理。Docker官方要求单独配置daemon代理。([Docker Docs][8])
+
+先创建仅root可读的代理文件：
+
+~~~bash
+sudo install -m 0600 /dev/null /etc/docker/proxy.env
+sudo nano /etc/docker/proxy.env
+~~~
+
+按实际网络填写，不要照抄示例地址：
+
+~~~text
+HTTP_PROXY=http://proxy.example.com:3128
+HTTPS_PROXY=http://proxy.example.com:3128
+NO_PROXY=localhost,127.0.0.1,::1
+~~~
+
+如果代理需要认证，应向网络管理员获取正确凭据，并对用户名或密码中的特殊字符做URL编码。不要把带凭据的URL写入Git仓库、公开文档或聊天记录。
+
+创建独立的systemd drop-in，不覆盖第10步的数据盘挂载配置：
+
+~~~bash
+sudo tee /etc/systemd/system/docker.service.d/proxy.conf >/dev/null <<'EOF'
+[Service]
+EnvironmentFile=/etc/docker/proxy.env
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+sudo systemctl --no-pager --full status docker
+~~~
+
+如果出现HTTP 407，说明已经到达代理，但代理认证缺失或无效；此时应修正代理凭据，不能通过关闭TLS验证来绕过。
+
+测试Docker daemon而不只是当前Shell：
+
+~~~bash
+sudo docker pull hello-world
+~~~
+
+### 12.3 代理属于误配置时
+
+如果服务器可以直连Docker Hub，而daemon仍使用旧代理，先确认代理来自<code>proxy.conf</code>、<code>proxy.env</code>还是<code>/etc/docker/daemon.json</code>。只在确认不再需要该代理后禁用：
+
+~~~bash
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+if [ -f /etc/systemd/system/docker.service.d/proxy.conf ]; then
+  sudo mv /etc/systemd/system/docker.service.d/proxy.conf \
+    "/etc/systemd/system/docker.service.d/proxy.conf.disabled.$STAMP"
+fi
+
+if [ -f /etc/docker/proxy.env ]; then
+  sudo mv /etc/docker/proxy.env \
+    "/etc/docker/proxy.env.disabled.$STAMP"
+fi
+
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+~~~
+
+如果代理写在<code>/etc/docker/daemon.json</code>的<code>proxies</code>字段中，只删除该字段；不要覆盖第10步已有的<code>data-root</code>、日志和NVIDIA runtime配置。
+
+### 12.4 慢速网络下减少并发下载
+
+代理或出口带宽不稳定时，可在保留现有配置的前提下降低并发下载并增加重试：
+
+~~~bash
+sudo python3 - <<'PY'
+import json
+import os
+
+path = "/etc/docker/daemon.json"
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+data["max-concurrent-downloads"] = 1
+data["max-download-attempts"] = 5
+
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl restart docker
+~~~
+
+这会降低拉取速度，但可能减少大镜像经过不稳定代理时的超时。
+
+### 12.5 使用可信Docker Hub镜像缓存（可选）
+
+只有学校、单位或云平台提供了可信的Docker Hub registry mirror时，才把它合并到<code>/etc/docker/daemon.json</code>的<code>registry-mirrors</code>字段。Docker官方支持该字段。([Docker Docs][10])
+
+不要从搜索结果中随意选择公共镜像站；镜像供应链和可用性无法保证。镜像地址需要由管理员提供，配置后仍应执行：
+
+~~~bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo systemctl restart docker
+sudo docker info | sed -n '/Registry Mirrors/,+5p'
+~~~
+
+### 12.6 正式拉取vLLM镜像
+
+拉取前确认Docker和containerd都已切换到数据盘：
+
+~~~bash
+sudo docker info --format 'DockerRootDir={{.DockerRootDir}}'
 sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
 ~~~
 
-如果仍显示<code>/var/lib/docker</code>或<code>/var/lib/containerd</code>，先返回第10步修复，不要继续拉取大镜像。
+如果仍显示<code>/var/lib/docker</code>或<code>/var/lib/containerd</code>，先返回第10步修复。
 
-DeepSeek-V4.1-Flash 官方 vLLM recipe 当前要求 **vLLM ≥0.30.0**，但 0.30.0 尚未正式发布，官方明确要求 NVIDIA 路线使用 nightly；普通旧 stable image 不建议用于该架构。([GitHub][1])
+执行准确的镜像命令：
 
-执行：
+~~~bash
+sudo docker pull vllm/vllm-openai:nightly
+~~~
 
-```bash
-docker pull vllm/vllm-openai:nightly
-```
+网络中断后可以重复执行同一条pull命令；Docker会复用已经完成的镜像层。
 
 检查：
 
-```bash
-docker images | grep vllm
-```
+~~~bash
+sudo docker images | grep vllm
+~~~
 
-再确认这个 image 能看到 GPU：
+再确认镜像能够看到GPU：
 
-```bash
-docker run --rm \
+~~~bash
+sudo docker run --rm \
     --gpus all \
     --entrypoint nvidia-smi \
     vllm/vllm-openai:nightly
-```
+~~~
+
+如果<code>/v2/</code>已正常返回401，但pull仍失败，把<code>sudo journalctl -u docker --since '-15 min'</code>中的错误行保存下来；不要粘贴代理凭据。
 
 ---
-
 # 13. 第一次启动：先求稳定
 
 第一次不要：
@@ -857,7 +1031,7 @@ eager mode
 执行：
 
 ```bash
-docker run -d \
+sudo docker run -d \
     --name deepseek-v41-flash \
     --gpus all \
     --ipc=host \
@@ -910,7 +1084,7 @@ docker run -d \
 看日志：
 
 ```bash
-docker logs -f deepseek-v41-flash
+sudo docker logs -f deepseek-v41-flash
 ```
 
 另开一个终端：
@@ -922,14 +1096,14 @@ watch -n 1 nvidia-smi
 再看 container：
 
 ```bash
-docker ps
+sudo docker ps
 ```
 
 如果 container 退出：
 
 ```bash
-docker ps -a
-docker logs --tail 300 deepseek-v41-flash
+sudo docker ps -a
+sudo docker logs --tail 300 deepseek-v41-flash
 ```
 
 ---
@@ -1030,8 +1204,8 @@ max   = 100
 第一次稳定后：
 
 ```bash
-docker stop deepseek-v41-flash
-docker rm deepseek-v41-flash
+sudo docker stop deepseek-v41-flash
+sudo docker rm deepseek-v41-flash
 ```
 
 重新执行上面的启动命令，但删掉：
@@ -1177,9 +1351,9 @@ V4.1-Flash 官方支持最大 **1,048,576 tokens**。([GitHub][1])
 执行：
 
 ~~~bash
-docker info --format 'DockerRootDir={{.DockerRootDir}}'
-docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
-docker info --format 'LoggingDriver={{.LoggingDriver}}'
+sudo docker info --format 'DockerRootDir={{.DockerRootDir}}'
+sudo docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+sudo docker info --format 'LoggingDriver={{.LoggingDriver}}'
 sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
 
 sudo du -sh \
@@ -1189,7 +1363,7 @@ sudo du -sh \
   /mnt/tydrive/txhan/.cache
 
 df -hT / /mnt/tydrive
-docker system df
+sudo docker system df
 ~~~
 
 还可以只读检查系统盘剩余的大目录：
@@ -1237,3 +1411,6 @@ sudo journalctl --vacuum-size=1G
 [5]: https://docs.docker.com/engine/daemon/#daemon-data-directory "Docker daemon data directory"
 [6]: https://docs.docker.com/engine/logging/drivers/local/ "Docker local logging driver"
 [7]: https://docs.astral.sh/uv/reference/storage/ "uv storage locations"
+[8]: https://docs.docker.com/engine/daemon/proxy/ "Docker daemon proxy configuration"
+[9]: https://docs.docker.com/engine/install/linux-postinstall/ "Docker Linux post-installation"
+[10]: https://docs.docker.com/docker-hub/image-library/mirror/ "Docker Hub registry mirror"

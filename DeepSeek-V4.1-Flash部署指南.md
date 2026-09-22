@@ -2,6 +2,8 @@
 
 可以。下面按你现在的实际情况给一套从零到可调用 API 的完整流程。这里默认你说的是 **DeepSeek-V4.1-Flash**，机器是 **单机 8×H20**，`/mnt/tydrive` 还有约 **2.2 TB** 可用。
 
+本文把所有主要大文件路径统一放到<code>/mnt/tydrive</code>：模型、Hugging Face缓存、uv/pip缓存、vLLM编译缓存、临时文件，以及Docker和containerd的镜像层、容器层、卷与构建缓存。系统盘只保留软件包、少量配置和运行时状态。
+
 你现有这两项保持不动：
 
 ```bash
@@ -23,6 +25,7 @@ echo "$HF_HUB_DISABLE_XET"
 
 nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
 free -h
+findmnt -T /mnt/tydrive
 df -h /mnt/tydrive
 df -h /
 ```
@@ -54,6 +57,16 @@ nvidia-smi topo -m
 │   └── DeepSeek-V4.1-Flash/
 ├── vllm_cache/
 └── tmp/
+
+/mnt/tydrive/txhan/.cache/
+├── huggingface/
+├── pip/
+└── uv/
+
+/mnt/tydrive/txhan/.local/share/uv/tools/
+
+/mnt/tydrive/docker-data/       # Docker daemon数据，root拥有
+/mnt/tydrive/containerd-data/   # Docker 29+ containerd镜像存储，root拥有
 ```
 
 创建：
@@ -62,6 +75,10 @@ nvidia-smi topo -m
 mkdir -p /mnt/tydrive/txhan/DeepSeek/models/DeepSeek-V4.1-Flash
 mkdir -p /mnt/tydrive/txhan/DeepSeek/vllm_cache
 mkdir -p /mnt/tydrive/txhan/DeepSeek/tmp
+mkdir -p /mnt/tydrive/txhan/.cache/huggingface
+mkdir -p /mnt/tydrive/txhan/.cache/pip
+mkdir -p /mnt/tydrive/txhan/.cache/uv
+mkdir -p /mnt/tydrive/txhan/.local/share/uv/tools
 ```
 
 ---
@@ -80,8 +97,20 @@ export DEEPSEEK_HOME=/mnt/tydrive/txhan/DeepSeek
 export MODEL_DIR=$DEEPSEEK_HOME/models/DeepSeek-V4.1-Flash
 export VLLM_CACHE_DIR=$DEEPSEEK_HOME/vllm_cache
 export DEEPSEEK_TMP=$DEEPSEEK_HOME/tmp
+export PIP_CACHE_DIR=/mnt/tydrive/txhan/.cache/pip
+export UV_CACHE_DIR=/mnt/tydrive/txhan/.cache/uv
+export UV_TOOL_DIR=/mnt/tydrive/txhan/.local/share/uv/tools
 
 EOF
+
+grep -qxF 'export PIP_CACHE_DIR=/mnt/tydrive/txhan/.cache/pip' ~/.bashrc \
+  || echo 'export PIP_CACHE_DIR=/mnt/tydrive/txhan/.cache/pip' >> ~/.bashrc
+
+grep -qxF 'export UV_CACHE_DIR=/mnt/tydrive/txhan/.cache/uv' ~/.bashrc \
+  || echo 'export UV_CACHE_DIR=/mnt/tydrive/txhan/.cache/uv' >> ~/.bashrc
+
+grep -qxF 'export UV_TOOL_DIR=/mnt/tydrive/txhan/.local/share/uv/tools' ~/.bashrc \
+  || echo 'export UV_TOOL_DIR=/mnt/tydrive/txhan/.local/share/uv/tools' >> ~/.bashrc
 ```
 
 生效：
@@ -99,6 +128,9 @@ echo "$DEEPSEEK_HOME"
 echo "$MODEL_DIR"
 echo "$VLLM_CACHE_DIR"
 echo "$DEEPSEEK_TMP"
+echo "$PIP_CACHE_DIR"
+echo "$UV_CACHE_DIR"
+echo "$UV_TOOL_DIR"
 ```
 
 应该类似：
@@ -110,6 +142,9 @@ echo "$DEEPSEEK_TMP"
 /mnt/tydrive/txhan/DeepSeek/models/DeepSeek-V4.1-Flash
 /mnt/tydrive/txhan/DeepSeek/vllm_cache
 /mnt/tydrive/txhan/DeepSeek/tmp
+/mnt/tydrive/txhan/.cache/pip
+/mnt/tydrive/txhan/.cache/uv
+/mnt/tydrive/txhan/.local/share/uv/tools
 ```
 
 注意我这里**没有全局设置 `TMPDIR`**，避免影响你服务器上 DSpark 等其他程序。
@@ -129,6 +164,20 @@ hf --version
 ```bash
 uv tool install huggingface_hub
 ```
+
+确认uv缓存和工具环境都位于数据盘：
+
+~~~bash
+uv cache dir
+uv tool dir
+~~~
+
+应分别指向：
+
+~~~text
+/mnt/tydrive/txhan/.cache/uv
+/mnt/tydrive/txhan/.local/share/uv/tools
+~~~
 
 如果装完还是找不到：
 
@@ -419,57 +468,340 @@ sudo systemctl restart docker
 
 这是 NVIDIA 当前官方 Docker 配置方式。([NVIDIA Docs][3])
 
+Docker和NVIDIA Container Toolkit安装完成后，可以清理APT下载缓存；软件本身仍正常保留：
+
+~~~bash
+sudo apt-get clean
+sudo du -sh /var/cache/apt 2>/dev/null || true
+~~~
+
 ---
 
-# 10. 测试 Docker 能不能看到 8 张 H20
+# 10. 将 Docker 和 containerd 大数据迁移到 /mnt/tydrive
 
-执行：
+这一步必须在第一次拉取CUDA或vLLM镜像前完成。Docker官方支持通过<code>data-root</code>迁移Docker daemon数据；但Docker Engine 29.0及以后新安装默认可能启用containerd image store，此时镜像内容和容器快照位于<code>/var/lib/containerd</code>，只修改<code>data-root</code>还不够。([Docker Docs][5])
 
-```bash
+本文统一使用：
+
+~~~text
+/mnt/tydrive/docker-data
+/mnt/tydrive/containerd-data
+~~~
+
+这两个目录是系统级容器存储，必须由root管理，不要放进普通用户可随意删除的项目目录。
+
+### 10.1 确认数据盘和现有容器状态
+
+先确认<code>/mnt/tydrive</code>确实是独立且持久挂载的数据盘，不是系统盘上的普通空目录：
+
+~~~bash
+findmnt -T /mnt/tydrive
+df -hT / /mnt/tydrive
+mountpoint /mnt/tydrive
+grep -F '/mnt/tydrive' /etc/fstab || true
+~~~
+
+<code>mountpoint</code>必须成功，<code>findmnt</code>应显示真实块设备或预期文件系统。如果该挂载没有写入<code>/etc/fstab</code>或其他可靠的开机挂载配置，先修复持久挂载，再迁移Docker。
+
+记录当前状态：
+
+~~~bash
+mkdir -p /mnt/tydrive/txhan/DeepSeek/migration-backup
+
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+docker ps -a --no-trunc \
+  | tee /mnt/tydrive/txhan/DeepSeek/migration-backup/docker-ps-before.txt
+docker images --digests \
+  | tee /mnt/tydrive/txhan/DeepSeek/migration-backup/docker-images-before.txt
+
+sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
+sudo ctr namespaces list 2>/dev/null || true
+~~~
+
+如果<code>ctr namespaces list</code>显示Kubernetes或其他非Docker工作负载，先确认这些服务的维护窗口和迁移方案，不要直接执行后续containerd迁移。
+
+### 10.2 停止服务并复制现有数据
+
+安装rsync并清理APT缓存：
+
+~~~bash
+command -v rsync >/dev/null || sudo apt-get install -y rsync
+sudo apt-get clean
+~~~
+
+停止Docker和containerd：
+
+~~~bash
+sudo systemctl stop docker.service docker.socket
+sudo systemctl stop containerd.service
+
+sudo systemctl is-active docker.service containerd.service || true
+~~~
+
+创建目标目录：
+
+~~~bash
+sudo install -d -m 0711 -o root -g root /mnt/tydrive/docker-data
+sudo install -d -m 0711 -o root -g root /mnt/tydrive/containerd-data
+~~~
+
+复制已有数据。源目录不存在或为空时，对应命令会自动跳过：
+
+~~~bash
+if [ -d /var/lib/docker ]; then
+  sudo rsync -aHAX --numeric-ids --info=progress2 \
+    /var/lib/docker/ /mnt/tydrive/docker-data/
+fi
+
+if [ -d /var/lib/containerd ]; then
+  sudo rsync -aHAX --numeric-ids --info=progress2 \
+    /var/lib/containerd/ /mnt/tydrive/containerd-data/
+fi
+~~~
+
+此时不要删除<code>/var/lib/docker</code>或<code>/var/lib/containerd</code>，它们仍是回滚副本。
+
+### 10.3 备份并合并Docker配置
+
+NVIDIA Container Toolkit可能已经在<code>/etc/docker/daemon.json</code>中写入runtime配置，因此不能用一个新的JSON文件直接覆盖。先备份：
+
+~~~bash
+STAMP="$(date +%Y%m%d-%H%M%S)"
+sudo install -d -m 0755 /mnt/tydrive/txhan/DeepSeek/migration-backup
+
+if [ -f /etc/docker/daemon.json ]; then
+  sudo cp -a /etc/docker/daemon.json \
+    "/mnt/tydrive/txhan/DeepSeek/migration-backup/daemon.json.$STAMP"
+fi
+
+if [ -f /etc/containerd/config.toml ]; then
+  sudo cp -a /etc/containerd/config.toml \
+    "/mnt/tydrive/txhan/DeepSeek/migration-backup/containerd-config.toml.$STAMP"
+fi
+~~~
+
+用Python合并Docker配置，保留现有NVIDIA runtime，同时增加数据目录和容器日志轮转：
+
+~~~bash
+sudo python3 - <<'PY'
+import json
+import os
+
+path = "/etc/docker/daemon.json"
+data = {}
+
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+data["data-root"] = "/mnt/tydrive/docker-data"
+data["log-driver"] = "local"
+data["log-opts"] = {
+    "max-size": "100m",
+    "max-file": "5"
+}
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+~~~
+
+Docker的<code>local</code>日志驱动自带轮转和压缩；这里再把单个容器日志限制为最多5个、每个100MB。该默认值只对之后新建的容器生效。([Docker Docs][6])
+
+### 10.4 配置containerd数据目录
+
+如果没有containerd配置文件，先从当前版本生成默认配置：
+
+~~~bash
+sudo install -d -m 0755 /etc/containerd
+
+if [ ! -s /etc/containerd/config.toml ]; then
+  containerd config default \
+    | sudo tee /etc/containerd/config.toml >/dev/null
+fi
+~~~
+
+只修改顶层<code>root</code>，运行时<code>state</code>仍保留在<code>/run/containerd</code>：
+
+~~~bash
+sudo python3 - <<'PY'
+import os
+import re
+
+path = "/etc/containerd/config.toml"
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+root_line = 'root = "/mnt/tydrive/containerd-data"'
+pattern = re.compile(r"(?m)^root\s*=\s*['\"][^'\"]*['\"]\s*$")
+
+if pattern.search(text):
+    text = pattern.sub(root_line, text, count=1)
+else:
+    version_pattern = re.compile(r"(?m)^version\s*=.*$")
+    match = version_pattern.search(text)
+    if match:
+        text = text[:match.end()] + "\n" + root_line + text[match.end():]
+    else:
+        text = root_line + "\n" + text
+
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    f.write(text)
+os.chmod(tmp, 0o644)
+os.replace(tmp, path)
+PY
+~~~
+
+验证两个配置文件：
+
+~~~bash
+sudo dockerd --validate --config-file=/etc/docker/daemon.json
+sudo containerd --config /etc/containerd/config.toml config dump >/dev/null
+
+sudo grep -nE '"data-root"|"log-driver"|"max-size"|"max-file"' \
+  /etc/docker/daemon.json
+sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
+~~~
+
+### 10.5 防止数据盘未挂载时误写系统盘
+
+为Docker和containerd增加systemd挂载依赖及启动前检查：
+
+~~~bash
+sudo install -d -m 0755 /etc/systemd/system/docker.service.d
+sudo install -d -m 0755 /etc/systemd/system/containerd.service.d
+
+sudo tee /etc/systemd/system/docker.service.d/tydrive.conf >/dev/null <<'EOF'
+[Unit]
+RequiresMountsFor=/mnt/tydrive
+
+[Service]
+ExecStartPre=/usr/bin/mountpoint -q /mnt/tydrive
+EOF
+
+sudo tee /etc/systemd/system/containerd.service.d/tydrive.conf >/dev/null <<'EOF'
+[Unit]
+RequiresMountsFor=/mnt/tydrive
+
+[Service]
+ExecStartPre=/usr/bin/mountpoint -q /mnt/tydrive
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl start containerd.service
+sudo systemctl start docker.service
+~~~
+
+检查服务与路径：
+
+~~~bash
+sudo systemctl --no-pager --full status containerd.service docker.service
+
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+docker info --format 'LoggingDriver={{.LoggingDriver}}'
+sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
+
+df -hT / /mnt/tydrive
+sudo du -sh /mnt/tydrive/docker-data /mnt/tydrive/containerd-data
+~~~
+
+目标结果：
+
+~~~text
+DockerRootDir=/mnt/tydrive/docker-data
+LoggingDriver=local
+root = "/mnt/tydrive/containerd-data"
+~~~
+
+### 10.6 验证后再回收系统盘旧数据
+
+先完成第11～16步、重启一次服务器，并再次确认Docker、GPU和DeepSeek容器都正常。验证期内保留原目录可快速回滚。
+
+稳定后如果要释放系统盘，可先把旧目录移到数据盘作为临时备份，而不是直接删除：
+
+~~~bash
+sudo systemctl stop docker.service docker.socket
+sudo systemctl stop containerd.service
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+if [ -d /var/lib/docker ]; then
+  sudo mv /var/lib/docker "/mnt/tydrive/docker-before-migration.$STAMP"
+fi
+
+if [ -d /var/lib/containerd ]; then
+  sudo mv /var/lib/containerd "/mnt/tydrive/containerd-before-migration.$STAMP"
+fi
+
+sudo systemctl start containerd.service
+sudo systemctl start docker.service
+
+df -h /
+~~~
+
+跨文件系统的<code>mv</code>会复制后再删除源目录，数据较大时需要等待。确认新目录长期稳定且不再需要回滚后，再人工处理这些数据盘备份。不要在首次迁移时直接<code>rm -rf /var/lib/docker</code>或<code>rm -rf /var/lib/containerd</code>。
+
+如果服务启动失败，保持Docker停止，恢复第10.3节备份的<code>daemon.json</code>和<code>config.toml</code>，执行<code>sudo systemctl daemon-reload</code>后重新启动。原系统盘目录尚未清理时，回滚不会丢失原镜像和容器。
+
+---
+
+# 11. 测试 Docker 能否看到 8 张 H20并复核磁盘
+
+现在执行的第一次镜像拉取应直接写入<code>/mnt/tydrive</code>：
+
+~~~bash
 docker run --rm \
     --gpus all \
     nvcr.io/nvidia/cuda:12.6.2-base-ubuntu24.04 \
     nvidia-smi
-```
+~~~
 
 必须看到：
 
-```text
+~~~text
 GPU 0 H20
 GPU 1 H20
 ...
 GPU 7 H20
-```
+~~~
 
 否则先不要继续。
 
----
+再次复核容器存储和系统盘：
 
-# 11. 检查 Docker 是否会吃系统盘
-
-Docker 默认可能使用：
-
-```text
-/var/lib/docker
-```
-
-查看：
-
-```bash
-docker info --format '{{.DockerRootDir}}'
-df -h /
+~~~bash
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+docker info --format 'LoggingDriver={{.LoggingDriver}}'
 docker system df
-```
 
-vLLM Docker 镜像本身远小于 511GB 模型，因此如果系统盘还有几十 GB 以上，一般不用动。
+sudo du -sh /mnt/tydrive/docker-data /mnt/tydrive/containerd-data
+sudo du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
+df -hT / /mnt/tydrive
+~~~
 
-你的**模型、编译缓存、临时文件都已经在 `/mnt/tydrive`**。
+必须确认Docker root位于<code>/mnt/tydrive/docker-data</code>。如果<code>DriverStatus</code>显示<code>io.containerd.snapshotter.v1</code>，镜像和快照还必须落在<code>/mnt/tydrive/containerd-data</code>。此后Docker镜像、容器可写层、卷、BuildKit缓存和容器日志都不再以系统盘为主要存储位置。
 
 ---
-
 # 12. 拉取 vLLM nightly
 
 这一点现在很重要。
+
+拉取前必须再次确认Docker和containerd都已切换到数据盘：
+
+~~~bash
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
+~~~
+
+如果仍显示<code>/var/lib/docker</code>或<code>/var/lib/containerd</code>，先返回第10步修复，不要继续拉取大镜像。
 
 DeepSeek-V4.1-Flash 官方 vLLM recipe 当前要求 **vLLM ≥0.30.0**，但 0.30.0 尚未正式发布，官方明确要求 NVIDIA 路线使用 nightly；普通旧 stable image 不建议用于该架构。([GitHub][1])
 
@@ -792,35 +1124,116 @@ V4.1-Flash 官方支持最大 **1,048,576 tokens**。([GitHub][1])
 
 ## 你最终的磁盘布局
 
-完成后大概是：
+完成后大致是：
 
-```text
-/mnt/tydrive/txhan/
+~~~text
+/mnt/tydrive/
 │
-├── .cache/
-│   └── huggingface/
-│       └── 你原来已有的 HF 缓存
+├── docker-data/                         # Docker daemon数据
+│   ├── containers/
+│   ├── volumes/
+│   ├── buildkit/
+│   └── ...
 │
-└── DeepSeek/
-    ├── models/
-    │   └── DeepSeek-V4.1-Flash/
-    │       ├── config.json
-    │       ├── *.safetensors
-    │       ├── encoding/
-    │       └── ...
+├── containerd-data/                     # Docker 29+镜像内容和快照
+│   ├── io.containerd.content.v1.content/
+│   ├── io.containerd.snapshotter.v1.overlayfs/
+│   └── ...
+│
+├── docker-before-migration.*            # 可选临时回滚副本
+├── containerd-before-migration.*        # 可选临时回滚副本
+│
+└── txhan/
+    ├── .cache/
+    │   ├── huggingface/
+    │   ├── pip/
+    │   └── uv/
     │
-    ├── vllm_cache/
-    │   └── 编译/JIT缓存
+    ├── .local/share/uv/tools/             # uv tool环境
     │
-    └── tmp/
-```
+    └── DeepSeek/
+        ├── models/
+        │   └── DeepSeek-V4.1-Flash/
+        │       ├── config.json
+        │       ├── *.safetensors
+        │       ├── encoding/
+        │       └── ...
+        │
+        ├── vllm_cache/
+        │   └── 编译/JIT缓存
+        │
+        ├── migration-backup/
+        │   ├── daemon.json.*
+        │   ├── containerd-config.toml.*
+        │   └── 迁移前清单
+        │
+        └── tmp/
+~~~
 
-你目前 **2.2 TB 可用**，模型本身约 **511 GB**，所以单独部署这一套空间非常充裕。([GitHub][1])
+系统盘仍会保留Docker、containerd和NVIDIA Container Toolkit的软件包，以及<code>/etc/docker</code>、<code>/etc/containerd</code>和systemd配置；这些体积很小且属于系统配置，不应迁移。主要增长项已经转到<code>/mnt/tydrive</code>。
 
-**你现在实际应该从第 0～7 步先做，把 511GB 模型完整下载并 `hf cache verify` 通过；然后再进行 Docker/vLLM 部署。**
+## 最终磁盘验收与系统盘清理
 
-[1]: https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml "recipes/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml at main · vllm-project/recipes · GitHub"
-[2]: https://huggingface.co/docs/huggingface_hub/guides/download?utm_source=chatgpt.com "Download files from the Hub · Hugging Face"
-[3]: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html?utm_source=chatgpt.com "Installing the NVIDIA Container Toolkit — NVIDIA Container Toolkit"
-[4]: https://github.com/vllm-project/vllm/issues/56389?utm_source=chatgpt.com "[Bug]: DeepSeek-V4.1-Flash dsv4_topk Triton illegal memory access under high concurrency on H20; mitigated by max_num_seqs=256 · Issue #56389 · vllm-project/vllm · GitHub"
+执行：
 
+~~~bash
+docker info --format 'DockerRootDir={{.DockerRootDir}}'
+docker info --format 'Driver={{.Driver}} DriverStatus={{json .DriverStatus}}'
+docker info --format 'LoggingDriver={{.LoggingDriver}}'
+sudo grep -n '^root[[:space:]]*=' /etc/containerd/config.toml
+
+sudo du -sh \
+  /mnt/tydrive/docker-data \
+  /mnt/tydrive/containerd-data \
+  /mnt/tydrive/txhan/DeepSeek \
+  /mnt/tydrive/txhan/.cache
+
+df -hT / /mnt/tydrive
+docker system df
+~~~
+
+还可以只读检查系统盘剩余的大目录：
+
+~~~bash
+sudo du -xhd1 /var 2>/dev/null | sort -h
+sudo du -xhd1 /root 2>/dev/null | sort -h
+du -xhd1 "$HOME" 2>/dev/null | sort -h
+journalctl --disk-usage
+~~~
+
+APT缓存可以安全清理：
+
+~~~bash
+sudo apt-get clean
+~~~
+
+如果systemd journal明显过大，并且已经保留完需要的故障证据，可选择限制历史日志总量：
+
+~~~bash
+sudo journalctl --vacuum-size=1G
+~~~
+
+该命令会删除较旧的journal日志，不要在仍需调查故障时执行。不要为了腾空间运行<code>docker system prune -a --volumes</code>；它可能删除仍需使用的镜像、缓存和卷。
+
+最终应同时满足：
+
+- 模型位于<code>/mnt/tydrive/txhan/DeepSeek/models</code>；
+- Hugging Face、pip、uv、uv tool和vLLM数据位于<code>/mnt/tydrive</code>；
+- Docker root为<code>/mnt/tydrive/docker-data</code>；
+- containerd root为<code>/mnt/tydrive/containerd-data</code>；
+- Docker日志驱动为带轮转的<code>local</code>；
+- 数据盘未挂载时Docker和containerd拒绝启动；
+- 第一次CUDA和vLLM镜像拉取发生在迁移完成之后；
+- 系统盘旧Docker/containerd目录只在验证期临时保留，之后按第10.6节移到数据盘。
+
+你目前<code>/mnt/tydrive</code>约有2.2TB可用，模型本身约511GB；迁移前仍需结合现有Docker镜像和containerd数据量确认剩余空间。([GitHub][1])
+
+实际执行顺序应为：先完成第0～7步并验证模型，再完成第8～11步的Docker安装、存储迁移和GPU检查；只有Docker与containerd路径都验证为<code>/mnt/tydrive</code>后，才从第12步开始拉取vLLM镜像。
+
+[1]: https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml "DeepSeek-V4.1-Flash vLLM recipe"
+[2]: https://huggingface.co/docs/huggingface_hub/guides/download "Hugging Face Hub download guide"
+[3]: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html "NVIDIA Container Toolkit install guide"
+[4]: https://github.com/vllm-project/vllm/issues/56389 "DeepSeek-V4.1-Flash H20 high-concurrency issue"
+[5]: https://docs.docker.com/engine/daemon/#daemon-data-directory "Docker daemon data directory"
+[6]: https://docs.docker.com/engine/logging/drivers/local/ "Docker local logging driver"
+[7]: https://docs.astral.sh/uv/reference/storage/ "uv storage locations"

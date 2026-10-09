@@ -2,6 +2,8 @@
 
 在已经安装好 Ubuntu 版 Pi Coding Agent（PI）的基础上，下面配置自部署的 `deepseek_V41`。
 
+当前 `deepseek_V41` 是待确认的模型 ID。若出现 `The model deepseek_V41 doesn't exist`，先按文末[确认服务端可用模型](#确认服务端可用模型)查询真实模型 ID，再确定 PI 的最终配置。
+
 根据之前提供的信息，配置如下：
 
 | 配置项 | 内容 |
@@ -325,3 +327,53 @@ curl --noproxy 10.90.79.129 -sS -i \
 还有一个关键问题：这套 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN=sk-`、`ANTHROPIC_MODEL=deepseek_V41` 配置，在 Claude Code 中是否已经测试成功？
 
 如果 Claude Code 能正常使用，而 PI 不行，就可以重点比较两者的实际请求路径和认证头，避免继续猜测服务端配置。
+
+## 确认服务端可用模型
+
+目前拿到的是一组尚未验证的自部署模型配置参数，无法确认服务端是否真正开放了 `deepseek_V41`。
+
+由于直接使用 `curl` 请求也返回：
+
+```text
+The model deepseek_V41 doesn't exist
+```
+
+因此，现阶段不用重装 PI，也不用专门安装 Claude Code。应该先确认服务端实际开放的模型名称。
+
+### 第一步：查询可用模型
+
+在 Ubuntu 运行：
+
+```bash
+curl --noproxy '*' -sS -i --max-time 15 \
+  http://10.90.79.129:8048/v1/models \
+  -H 'Authorization: Bearer sk-'
+```
+
+根据结果判断：
+
+| 返回结果 | 下一步 |
+| --- | --- |
+| `200 OK`，有模型列表 | 使用列表中的真实模型 ID。 |
+| `200 OK`，但没有 `deepseek_V41` | 检查部署方提供的模型名称是否正确。 |
+| `401/403` | 检查 `sk-` 是否为有效凭证。 |
+| `404` | 网关可能未开放模型列表接口。 |
+
+### 第二步：如果模型列表查询失败
+
+服务器使用 `uvicorn`，可能通过 FastAPI 提供接口。可以尝试：
+
+```bash
+curl --noproxy '*' -sS -i \
+  http://10.90.79.129:8048/openapi.json
+```
+
+如果返回 OpenAPI JSON，就可以进一步检查服务实际提供了哪些路由。如果返回 `404`，也不能证明模型服务有问题。
+
+### 第三步：确认服务端配置
+
+如果前面都查不到，需要向提供模型服务的人确认：
+
+> 目前使用 `http://10.90.79.129:8048`，Token 为 `sk-`，模型 ID 为 `deepseek_V41`，请求 `/v1/messages` 返回 404，提示 `The model deepseek_V41 doesn't exist`。请确认实际可用的模型 ID、API 协议、接口地址以及该 Token 的模型访问权限。
+
+现在最重要的是第一步。继续排查时，需要提供 `/v1/models` 的完整返回结果（隐藏敏感凭据）。先确认服务器能提供哪些模型，再决定 PI 的最终配置。

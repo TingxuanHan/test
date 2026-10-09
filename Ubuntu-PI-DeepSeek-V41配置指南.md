@@ -10,7 +10,7 @@
 | 模型 ID | `deepseek_V41` |
 | API 地址 | `http://10.90.79.129:8048` |
 | API 协议 | Anthropic Messages（优先尝试） |
-| 认证 Token | `ANTHROPIC_AUTH_TOKEN` |
+| 认证 Token | `sk-`（环境变量 `ANTHROPIC_AUTH_TOKEN`） |
 
 建议单独创建 `deepseek-local` Provider，不覆盖 PI 自带的 Anthropic Provider，这样后续还能切换其他模型。
 
@@ -71,7 +71,7 @@ echo
 export ANTHROPIC_AUTH_TOKEN
 ```
 
-输入原来配置中的完整 `sk-...` Token，回车即可。使用这种方式不会把 Token 明文写入 shell 命令历史。
+输入当前提供的完整 Token 值 `sk-`，回车即可，不需要追加其他字符。使用这种方式不会把 Token 明文写入 shell 命令历史。直接填写字面值的完整配置见文末“Token 配置修正”。
 
 再设置内网地址绕过代理：
 
@@ -237,3 +237,91 @@ curl --noproxy 10.90.79.129 -i --max-time 20 \
 2. 第二步 `curl` 的 HTTP 状态码和错误内容（隐藏任何密钥）。
 
 这些信息用于进一步判断 API 地址是否需要调整，或 `deepseek_V41` 的模型路由是否存在。
+
+## Token 配置修正
+
+当前提供的 Token 就是完整的 `sk-`，没有任何其他字符，不是以 `sk-` 开头的一串密钥。因此，之前填写 `sk-你的完整密钥` 的操作需要修正。
+
+可以在 PI 的配置中直接使用：
+
+```json
+"apiKey": "sk-"
+```
+
+或者在 Ubuntu 中设置：
+
+```bash
+export ANTHROPIC_AUTH_TOKEN="sk-"
+```
+
+Token 只有 `sk-` 并不一定是错误。自部署服务可能没有严格校验 Token，只要求请求携带认证字段。
+
+此前两个接口都返回了 `404`，因此更值得优先排查 API 路由或模型名称，而不是 Token 长度。
+
+### 修改 PI 配置
+
+执行：
+
+```bash
+nano ~/.pi/agent/models.json
+```
+
+将 `deepseek-local` 的配置调整为：
+
+```json
+{
+  "providers": {
+    "deepseek-local": {
+      "baseUrl": "http://10.90.79.129:8048",
+      "api": "anthropic-messages",
+      "apiKey": "sk-",
+      "authHeader": true,
+      "models": [
+        {
+          "id": "deepseek_V41",
+          "name": "DeepSeek V4.1",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}
+```
+
+这里 `contextWindow` 和 `maxTokens` 是暂用的配置值，不代表已经确认服务端具有对应能力。
+
+PI 官方文档确认，`apiKey` 可以直接填写字面值，`authHeader: true` 会增加 Bearer 认证头。参见 [PI 自定义模型配置说明](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/models.md)。
+
+保存后运行：
+
+```bash
+pi --provider deepseek-local --model deepseek_V41
+```
+
+### 如果还是 NotFound Error
+
+执行这条命令，直接检查服务端返回的错误正文：
+
+```bash
+curl --noproxy 10.90.79.129 -sS -i \
+  http://10.90.79.129:8048/v1/messages \
+  -H 'Authorization: Bearer sk-' \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "deepseek_V41",
+    "max_tokens": 32,
+    "messages": [
+      {"role": "user", "content": "Hello"}
+    ]
+  }'
+```
+
+如果仍然是 `404`，需要提供**完整的 HTTP 错误响应（尤其是 JSON 中的 `message` 字段）**，以便继续定位。
+
+还有一个关键问题：这套 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN=sk-`、`ANTHROPIC_MODEL=deepseek_V41` 配置，在 Claude Code 中是否已经测试成功？
+
+如果 Claude Code 能正常使用，而 PI 不行，就可以重点比较两者的实际请求路径和认证头，避免继续猜测服务端配置。
